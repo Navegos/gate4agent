@@ -40,7 +40,29 @@ const INNER_KEEPALIVE: smoltcp::time::Duration = smoltcp::time::Duration::from_s
 /// Unacked time after which the inner TCP socket is reset.
 const INNER_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(45);
 /// Recreate the UDP socket + initiation when the handshake is this old.
-const HANDSHAKE_STALE: Duration = Duration::from_secs(60);
+const HANDSHAKE_STALE: Duration = Duration::from_secs(180);
+/// First handshake must arrive within this time after session start.
+const FIRST_HANDSHAKE: Duration = Duration::from_secs(60);
+/// A tunnel that received any datagram within this window is alive.
+const RX_QUIET: Duration = Duration::from_secs(60);
+
+/// Self-heal decision. Rekey happens every 120 s, so handshake age up to
+/// REJECT_AFTER_TIME (180 s) is normal; also require recent inbound silence.
+pub(crate) fn rebind_reason(
+    handshake_age_secs: Option<u64>,
+    since_start: Duration,
+    since_rx: Duration,
+) -> Option<&'static str> {
+    if since_rx < RX_QUIET {
+        return None;
+    }
+    match handshake_age_secs {
+        Some(age) if age >= HANDSHAKE_STALE.as_secs() => Some("handshake_stale"),
+        Some(_) => None,
+        None if since_start >= FIRST_HANDSHAKE => Some("handshake_timeout"),
+        None => None,
+    }
+}
 
 /// Dial `addr` through the in-process tunnel when it matches the peer.
 /// Returns `Ok(None)` when no session is up or the address is not the peer.
@@ -87,18 +109,22 @@ fn supervisor_loop(config: NodeWgPeerConfig) {
     let mut backoff = Duration::from_secs(1);
     let mut live_stop: Option<Arc<AtomicBool>> = None;
     let mut session_started: Option<StdInstant> = None;
+    let mut last_rx = StdInstant::now();
+    let mut last_udp_in = 0u64;
 
     loop {
         let st = wg_status::WgStatus::snapshot();
         // Only an established-but-old handshake is "stale". A missing
         // handshake means we are still waiting — give it HANDSHAKE_STALE
         // from session start before recreating the UDP socket.
-        let stale = match st.handshake_age_secs {
-            Some(age) => age >= HANDSHAKE_STALE.as_secs(),
-            None => session_started
-                .map(|t| t.elapsed() >= HANDSHAKE_STALE)
-                .unwrap_or(false),
-        };
+        if st.udp_in != last_udp_in {
+            last_udp_in = st.udp_in;
+            last_rx = StdInstant::now();
+        }
+        let reason = session_started.and_then(|start| {
+            rebind_reason(st.handshake_age_secs, start.elapsed(), last_rx.elapsed())
+        });
+        let stale = reason.is_some();
         let need_start = live_stop
             .as_ref()
             .map_or(true, |s| s.load(Ordering::SeqCst));
@@ -112,17 +138,15 @@ fn supervisor_loop(config: NodeWgPeerConfig) {
             if stale && !need_start {
                 wg_status::set_rebinding();
                 wg_status::bump_rebind();
-                let reason = if st.handshake_age_secs.is_some() {
-                    "handshake_stale"
-                } else {
-                    "handshake_timeout"
-                };
+                let reason = reason.unwrap_or("handshake_stale");
                 node_log::warn("wg_rebind", &[("reason", reason.into())]);
             }
             match start_session(&config) {
                 Ok(stop) => {
                     live_stop = Some(stop);
                     session_started = Some(StdInstant::now());
+                    last_rx = StdInstant::now();
+                    last_udp_in = 0;
                     wg_status::set_up();
                     backoff = Duration::from_secs(1);
                     node_log::info(
@@ -376,6 +400,7 @@ fn pump(
         let mut recvd = [0u8; 2048];
         match udp.recv_from(&mut recvd) {
             Ok((n, src)) => {
+                udp_in = udp_in.saturating_add(1);
                 let mut datagram = recvd[..n].to_vec();
                 loop {
                     let outcome = tunn.decapsulate(Some(src.ip()), &datagram, &mut tun_buf);
@@ -395,7 +420,6 @@ fn pump(
                         }
                         TunnResult::WriteToTunnelV4(packet, _)
                         | TunnResult::WriteToTunnelV6(packet, _) => {
-                            udp_in = udp_in.saturating_add(1);
                             device.rx.push_back(packet.to_vec());
                         }
                         TunnResult::Done | TunnResult::Err(_) => break,
@@ -560,4 +584,34 @@ fn send_out(udp: &UdpSocket, dst: SocketAddr, result: TunnResult<'_>) -> i32 {
         };
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rebind_reason;
+    use std::time::Duration;
+    const S: fn(u64) -> Duration = Duration::from_secs;
+
+    #[test]
+    fn rekey_window_is_not_stale() {
+        assert_eq!(rebind_reason(Some(130), S(600), S(120)), None);
+        assert_eq!(rebind_reason(Some(179), S(600), S(120)), None);
+    }
+
+    #[test]
+    fn recent_rx_keeps_tunnel_even_if_handshake_old() {
+        assert_eq!(rebind_reason(Some(400), S(600), S(10)), None);
+        assert_eq!(rebind_reason(None, S(600), S(10)), None);
+    }
+
+    #[test]
+    fn old_handshake_and_silence_rebinds() {
+        assert_eq!(rebind_reason(Some(180), S(600), S(60)), Some("handshake_stale"));
+    }
+
+    #[test]
+    fn first_handshake_timeout() {
+        assert_eq!(rebind_reason(None, S(30), S(90)), None);
+        assert_eq!(rebind_reason(None, S(60), S(60)), Some("handshake_timeout"));
+    }
 }
