@@ -1,10 +1,11 @@
-//! Kernel WireGuard peer for node↔C2.
+//! Node↔C2 WireGuard peer.
 //!
-//! Node and C2 are peers: either side may dial. This is `ip link add type
-//! wireguard` plus `wg set`. It does not open the UDP+ChaCha mesh underlay
-//! and it does not call the mesh daemon stub. HQ is not configured
-//! here. The driver may be replaced later; this build uses kernel WireGuard.
-//! A failed `ip link add type wireguard` is an error, not a fallback.
+//! Default: in-process userspace (boringtun + smoltcp) on a normal UDP socket.
+//! No system TUN, no routes, no elevation. Only this process's dials to the
+//! peer tunnel address go through the tunnel (see [`tcp_connect`]).
+//!
+//! Opt-in kernel WireGuard (`ip link` / `wg`) when `GATE4AGENT_WG_KERNEL=1`.
+//! Does not open the UDP+ChaCha mesh underlay and does not call the mesh stub.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -15,8 +16,13 @@ use thiserror::Error;
 
 pub use crate::wg_status::WgStatus;
 
+#[cfg(feature = "wireguard")]
+#[path = "kit_wireguard_inside.rs"]
+mod userspace;
+
+
 /// Link tag so the kit binary retains this module.
-pub const LINK_TAG: &str = "kernel-wireguard-node-c2-peer";
+pub const LINK_TAG: &str = "userspace-wireguard-node-c2-peer";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeWgPeerConfig {
@@ -83,75 +89,88 @@ fn valid_iface(name: &str) -> bool {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum NodeWgPeerError {
-    #[error("kernel wireguard needs a listen port or a peer endpoint so either side can dial")]
+    #[error("wireguard needs a listen port or a peer endpoint so either side can dial")]
     NobodyDials,
-    #[error("kernel wireguard peer endpoint is invalid")]
+    #[error("wireguard peer endpoint is invalid")]
     Endpoint,
-    #[error("kernel wireguard interface name is invalid")]
+    #[error("wireguard interface name is invalid")]
     InterfaceName,
-    #[error("kernel wireguard private key path is empty")]
+    #[error("wireguard private key path is empty")]
     PrivateKeyPath,
-    #[error("kernel wireguard tunnel addresses are invalid")]
+    #[error("wireguard tunnel addresses are invalid")]
     TunnelAddress,
-    #[error("kernel wireguard peer public key is empty")]
+    #[error("wireguard peer public key is empty")]
     PeerKey,
-    #[error("kernel wireguard control port must be nonzero")]
+    #[error("wireguard control port must be nonzero")]
     ControlPort,
-    #[error("kernel wireguard interface was not created: {0}")]
+    #[error("wireguard interface was not created: {0}")]
     InterfaceCreate(String),
-    #[error("kernel wireguard setup failed: {0}")]
+    #[error("wireguard setup failed: {0}")]
     Setup(String),
 }
 
+fn env_kernel_opt_in() -> bool {
+    match std::env::var(WG_KERNEL_ENV) {
+        Ok(v) => matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"),
+        _ => false,
+    }
+}
+
 /// Creates the node↔C2 WireGuard peer.
-/// Allowed IPs and the installed route are only the C2 tunnel host.
-/// Linux: `ip link add type wireguard`, and a failed `ip` is an error.
-/// Windows, no tun on the machine: one adapter and a host route for the peer.
-/// Windows, a tun already owns the default route: no adapter and no route.
-/// The WireGuard session runs in this process and its UDP leaves through that tun.
+///
+/// Default: userspace supervisor (boringtun + smoltcp). No system TUN.
+/// With [`WG_KERNEL_ENV`]=1 on non-Windows: kernel `ip`/`wg` (needs CAP_NET_ADMIN).
 pub fn bring_up_node_wireguard(config: &NodeWgPeerConfig) -> Result<IpAddr, NodeWgPeerError> {
     config.validate()?;
     require_key_file(&config.private_key_path)?;
     let _ = crate::node_log::init_from_env();
-    #[cfg(windows)]
-    {
-        // Supervisor retries forever; this call only starts it.
-        crate::kit_wireguard_windows::bring_up(config)?;
-        crate::node_log::info(
-            "wg_supervisor_started",
-            &[("iface", config.interface_name.clone())],
-        );
-        return Ok(config.peer_tunnel_address);
-    }
-    #[cfg(not(windows))]
-    {
-        match bring_up_linux(config) {
-            Ok(ip) => {
-                crate::wg_status::set_up();
-                crate::node_log::info(
-                    "wg_bring_up_ok",
-                    &[("variant", "kernel".into()), ("iface", config.interface_name.clone())],
-                );
-                Ok(ip)
-            }
-            Err(error) => {
-                crate::wg_status::set_down();
-                crate::node_log::error(
-                    "wg_bring_up_err",
-                    &[
-                        ("variant", "kernel".into()),
-                        ("error", error.to_string()),
-                    ],
-                );
-                Err(error)
+    if env_kernel_opt_in() {
+        #[cfg(not(windows))]
+        {
+            match bring_up_linux(config) {
+                Ok(ip) => {
+                    crate::wg_status::set_up();
+                    crate::node_log::info(
+                        "wg_bring_up_ok",
+                        &[
+                            ("variant", "kernel".into()),
+                            ("iface", config.interface_name.clone()),
+                        ],
+                    );
+                    return Ok(ip);
+                }
+                Err(error) => {
+                    crate::wg_status::set_down();
+                    crate::node_log::error(
+                        "wg_bring_up_err",
+                        &[("variant", "kernel".into()), ("error", error.to_string())],
+                    );
+                    return Err(error);
+                }
             }
         }
+        #[cfg(windows)]
+        {
+            crate::node_log::warn(
+                "wg_kernel_ignored",
+                &[("reason", "kernel opt-in is unix-only; using userspace".into())],
+            );
+        }
     }
+    userspace::bring_up(config)?;
+    crate::node_log::info(
+        "wg_supervisor_started",
+        &[("variant", "userspace".into()), ("iface", config.interface_name.clone())],
+    );
+    Ok(config.peer_tunnel_address)
 }
 
-/// Spawn a background retry loop for Linux kernel WireGuard. The node process
-/// stays up while the tunnel is down (`WgStatus` reports `down`).
+/// Background retry for the opt-in kernel path only. Userspace has its own supervisor.
 pub fn spawn_linux_wireguard_retry(config: NodeWgPeerConfig) {
+    if !env_kernel_opt_in() {
+        let _ = config;
+        return;
+    }
     #[cfg(windows)]
     {
         let _ = config;
@@ -168,7 +187,10 @@ pub fn spawn_linux_wireguard_retry(config: NodeWgPeerConfig) {
                             crate::wg_status::set_up();
                             crate::node_log::info(
                                 "wg_bring_up_ok",
-                                &[("variant", "kernel".into()), ("iface", config.interface_name.clone())],
+                                &[
+                                    ("variant", "kernel".into()),
+                                    ("iface", config.interface_name.clone()),
+                                ],
                             );
                             return;
                         }
@@ -201,14 +223,11 @@ fn bring_up_linux(config: &NodeWgPeerConfig) -> Result<IpAddr, NodeWgPeerError> 
     Ok(config.peer_tunnel_address)
 }
 
-/// Dial `addr`. When this process already has an in-process WireGuard session
-/// for that peer, the stream is carried inside it. Otherwise this is a normal connect.
+/// Dial `addr`. When this process has a userspace WireGuard session for that
+/// peer tunnel address, the stream is carried inside it. Otherwise OS connect.
 pub fn tcp_connect(addr: SocketAddr) -> std::io::Result<std::net::TcpStream> {
-    #[cfg(all(windows, feature = "wireguard"))]
-    {
-        if let Some(stream) = crate::kit_wireguard_windows::connect_inside(addr)? {
-            return Ok(stream);
-        }
+    if let Some(stream) = userspace::connect(addr)? {
+        return Ok(stream);
     }
     std::net::TcpStream::connect(addr)
 }
@@ -364,6 +383,8 @@ pub const WG_PEER_ADDRESS_ENV: &str = "GATE4AGENT_WG_PEER_ADDRESS";
 pub const WG_PEER_KEY_ENV: &str = "GATE4AGENT_WG_PEER_KEY";
 pub const WG_PEER_ENDPOINT_ENV: &str = "GATE4AGENT_WG_PEER_ENDPOINT";
 pub const WG_KEEPALIVE_ENV: &str = "GATE4AGENT_WG_KEEPALIVE";
+/// Opt-in kernel WireGuard (`ip`/`wg`) instead of the default userspace path.
+pub const WG_KERNEL_ENV: &str = "GATE4AGENT_WG_KERNEL";
 
 fn required_env(name: &str) -> Result<String, String> {
     match std::env::var(name) {
@@ -425,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_module_source_is_not_the_mesh_stub() {
+    fn userspace_module_source_is_not_the_mesh_stub() {
         let source = include_str!("kit_wireguard.rs");
         let code = source
             .lines()
@@ -439,6 +460,6 @@ mod tests {
         assert!(!code.to_ascii_lowercase().contains("chacha"));
         assert!(!code.contains("HqWg"));
         assert!(!code.contains(concat!("open_wireguard", "_daemon_stub")));
-        assert_eq!(LINK_TAG, "kernel-wireguard-node-c2-peer");
+        assert_eq!(LINK_TAG, "userspace-wireguard-node-c2-peer");
     }
 }

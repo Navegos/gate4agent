@@ -8,10 +8,7 @@ pub mod session_registry;
 pub mod spawn_spec;
 pub mod node_log;
 pub mod wg_status;
-pub mod kit_wireguard_placement;
 #[cfg(feature = "wireguard")]
 pub mod kit_wireguard;
-#[cfg(all(feature = "wireguard", windows))]
-mod kit_wireguard_windows;
 
 pub use gate4agent_node_protocol as protocol;

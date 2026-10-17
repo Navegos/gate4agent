@@ -1,15 +1,18 @@
-//! WireGuard inside an already-up tun. No adapter and no route are created.
-//! Ciphertext UDP leaves through that tun. TCP to the peer tunnel address
-//! is terminated in this process.
+//! In-process WireGuard (boringtun + smoltcp). No system TUN, no routes, no
+//! elevation. Ciphertext leaves on a normal UDP socket; the OS routes it.
+//! TCP to the configured peer tunnel address is terminated in this process
+//! and exposed to callers via [`connect`].
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
+use base64::Engine;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use smoltcp::iface::{Config, Interface, SocketSet};
@@ -18,9 +21,7 @@ use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
-use crate::kit_wireguard::NodeWgPeerConfig;
-
-use super::bind_v4_exit;
+use crate::kit_wireguard::{NodeWgPeerConfig, NodeWgPeerError};
 
 struct Gate {
     peer: IpAddr,
@@ -38,9 +39,15 @@ static GATE: Mutex<Option<Gate>> = Mutex::new(None);
 const INNER_KEEPALIVE: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(15);
 /// Unacked time after which the inner TCP socket is reset.
 const INNER_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(45);
+/// Recreate the UDP socket + initiation when the handshake is this old.
+const HANDSHAKE_STALE: Duration = Duration::from_secs(60);
 
+/// Dial `addr` through the in-process tunnel when it matches the peer.
+/// Returns `Ok(None)` when no session is up or the address is not the peer.
 pub(super) fn connect(addr: SocketAddr) -> std::io::Result<Option<TcpStream>> {
-    let guard = GATE.lock().map_err(|_| std::io::Error::other("wireguard gate lock"))?;
+    let guard = GATE
+        .lock()
+        .map_err(|_| std::io::Error::other("wireguard gate lock"))?;
     let Some(gate) = guard.as_ref() else {
         return Ok(None);
     };
@@ -62,40 +69,140 @@ pub(super) fn connect(addr: SocketAddr) -> std::io::Result<Option<TcpStream>> {
     Ok(Some(stream))
 }
 
-pub(super) fn start(
+/// Spawn the forever supervisor: userspace pump with self-heal on stale handshake.
+pub(super) fn bring_up(config: &NodeWgPeerConfig) -> Result<(), NodeWgPeerError> {
+    let config = config.clone();
+    std::thread::Builder::new()
+        .name("wg-supervisor".to_owned())
+        .spawn(move || supervisor_loop(config))
+        .map_err(|error| NodeWgPeerError::Setup(format!("wireguard supervisor: {error}")))?;
+    Ok(())
+}
+
+fn supervisor_loop(config: NodeWgPeerConfig) {
+    use crate::node_log;
+    use crate::wg_status;
+
+    let _ = node_log::init_from_env();
+    let mut backoff = Duration::from_secs(1);
+    let mut live_stop: Option<Arc<AtomicBool>> = None;
+
+    loop {
+        let stale = {
+            let st = wg_status::WgStatus::snapshot();
+            match st.handshake_age_secs {
+                None => live_stop.is_some(),
+                Some(age) => age >= HANDSHAKE_STALE.as_secs(),
+            }
+        };
+        let need_start = live_stop
+            .as_ref()
+            .map_or(true, |s| s.load(Ordering::SeqCst));
+
+        if need_start || stale {
+            if let Some(stop) = live_stop.take() {
+                stop.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            if stale && !need_start {
+                wg_status::set_rebinding();
+                wg_status::bump_rebind();
+                node_log::warn("wg_rebind", &[("reason", "handshake_stale".into())]);
+            }
+            match start_session(&config) {
+                Ok(stop) => {
+                    live_stop = Some(stop);
+                    wg_status::set_up();
+                    backoff = Duration::from_secs(1);
+                    node_log::info(
+                        "wg_bring_up_ok",
+                        &[("variant", "userspace".into())],
+                    );
+                }
+                Err(error) => {
+                    wg_status::set_down();
+                    node_log::error(
+                        "wg_bring_up_err",
+                        &[("variant", "userspace".into()), ("error", error)],
+                    );
+                    log_stats();
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    continue;
+                }
+            }
+        }
+
+        log_stats();
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+fn log_stats() {
+    use crate::node_log;
+    use crate::wg_status;
+    let st = wg_status::WgStatus::snapshot();
+    node_log::info(
+        "wg_stats",
+        &[
+            ("udp_out", st.udp_out.to_string()),
+            ("udp_in", st.udp_in.to_string()),
+            ("send_fail", st.send_fail.to_string()),
+            ("last_err", st.last_err.to_string()),
+            (
+                "session",
+                if st.handshake_age_secs.is_some() {
+                    "1"
+                } else {
+                    "0"
+                }
+                .into(),
+            ),
+            (
+                "handshake_age_secs",
+                st.handshake_age_secs
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".into()),
+            ),
+            ("state", st.state),
+            ("rebind_count", st.rebind_count.to_string()),
+        ],
+    );
+}
+
+fn start_session(config: &NodeWgPeerConfig) -> Result<Arc<AtomicBool>, String> {
+    let (secret, peer_key) = load_keys(&config.private_key_path, &config.peer_public_key)?;
+    start(config, secret, peer_key)
+}
+
+fn start(
     config: &NodeWgPeerConfig,
     secret: StaticSecret,
     peer_key: PublicKey,
-    exit_if: Option<u32>,
 ) -> Result<Arc<AtomicBool>, String> {
     let IpAddr::V4(local) = config.local_tunnel_address else {
-        return Err("inside-existing tunnel is ipv4 only".to_owned());
+        return Err("userspace tunnel is ipv4 only".to_owned());
     };
     let IpAddr::V4(peer) = config.peer_tunnel_address else {
-        return Err("inside-existing tunnel is ipv4 only".to_owned());
+        return Err("userspace tunnel is ipv4 only".to_owned());
     };
     let endpoint = config
         .peer_endpoint
-        .ok_or_else(|| "inside-existing tunnel needs the peer endpoint".to_owned())?;
+        .ok_or_else(|| "userspace tunnel needs the peer endpoint".to_owned())?;
     let udp = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.listen_port)))
         .map_err(|error| format!("udp bind: {error}"))?;
     udp.set_read_timeout(Some(Duration::from_millis(50)))
         .map_err(|error| format!("udp timeout: {error}"))?;
-    if let Some(if_index) = exit_if {
-        bind_v4_exit(&udp, if_index)?;
-    }
     let index = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(1);
-    let tunn = Tunn::new(
-        secret,
-        peer_key,
-        None,
-        (config.persistent_keepalive_secs > 0).then_some(config.persistent_keepalive_secs),
-        index,
-        None,
-    );
+    let keepalive = if config.persistent_keepalive_secs > 0 {
+        Some(config.persistent_keepalive_secs)
+    } else {
+        Some(25)
+    };
+    let tunn = Tunn::new(secret, peer_key, None, keepalive, index, None);
     let (tx, rx) = sync_channel(8);
     let gate = Gate {
         peer: config.peer_tunnel_address,
@@ -107,12 +214,30 @@ pub(super) fn start(
     }
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
-    let exit_if_watch = exit_if.unwrap_or(0);
     std::thread::Builder::new()
-        .name("wg-inside".to_owned())
-        .spawn(move || pump(local, peer, endpoint, udp, tunn, rx, stop_thread, exit_if_watch))
+        .name("wg-userspace".to_owned())
+        .spawn(move || pump(local, peer, endpoint, udp, tunn, rx, stop_thread))
         .map_err(|error| format!("wireguard thread: {error}"))?;
     Ok(stop)
+}
+
+fn load_keys(path: &Path, peer_b64: &str) -> Result<(StaticSecret, PublicKey), String> {
+    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let ours = decode_key(text.trim())?;
+    let peer = decode_key(peer_b64.trim())?;
+    Ok((StaticSecret::from(ours), PublicKey::from(peer)))
+}
+
+fn decode_key(text: &str) -> Result<[u8; 32], String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(text))
+        .map_err(|error| format!("wireguard key: {error}"))?;
+    let array: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("wireguard key is {} bytes", bytes.len()))?;
+    Ok(array)
 }
 
 struct Link {
@@ -182,7 +307,6 @@ fn pump(
     mut tunn: Tunn,
     jobs: std::sync::mpsc::Receiver<Job>,
     stop: Arc<AtomicBool>,
-    exit_if: u32,
 ) {
     let mut device = IpDev {
         rx: VecDeque::new(),
@@ -212,7 +336,11 @@ fn pump(
         &mut udp_out,
         &mut send_fail,
         &mut last_err,
-        send_out(&udp, endpoint, tunn.format_handshake_initiation(&mut net_buf, false)),
+        send_out(
+            &udp,
+            endpoint,
+            tunn.format_handshake_initiation(&mut net_buf, false),
+        ),
     );
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -254,7 +382,8 @@ fn pump(
                                 },
                             );
                         }
-                        TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                        TunnResult::WriteToTunnelV4(packet, _)
+                        | TunnResult::WriteToTunnelV6(packet, _) => {
                             udp_in = udp_in.saturating_add(1);
                             device.rx.push_back(packet.to_vec());
                         }
@@ -280,10 +409,6 @@ fn pump(
                     next_port = next_port.wrapping_add(1).max(20_000);
                     let connected = {
                         let socket = sockets.get_mut::<tcp::Socket>(handle);
-                        // The loopback leg cannot see the tunnel die, so the
-                        // inner socket must: probe when idle, give up when
-                        // the peer stops acking. Its abort closes the loopback
-                        // stream and the caller's reconnect logic runs.
                         socket.set_keep_alive(Some(INNER_KEEPALIVE));
                         socket.set_timeout(Some(INNER_TIMEOUT));
                         socket
@@ -333,16 +458,11 @@ fn pump(
                     ),
                 );
             }
-            let age = tunn
-                .time_since_last_handshake()
-                .map(|d| d.as_secs());
+            let age = tunn.time_since_last_handshake().map(|d| d.as_secs());
             crate::wg_status::publish_stats(udp_out, udp_in, send_fail, last_err, age);
-            crate::wg_status::set_exit_if(exit_if);
             if age.is_some() {
                 crate::wg_status::set_up();
             }
-            let _ = links.len();
-            let _ = exit_if;
             reported = StdInstant::now();
         }
         let mut keep = Vec::new();
@@ -374,7 +494,9 @@ fn pump(
                         link.to_local.extend(tmp[..n].iter().copied());
                     }
                 }
-                if link.opened.elapsed() > Duration::from_secs(20) && !socket.may_send() && link.to_local.is_empty()
+                if link.opened.elapsed() > Duration::from_secs(20)
+                    && !socket.may_send()
+                    && link.to_local.is_empty()
                 {
                     socket.abort();
                     continue;
