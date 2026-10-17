@@ -46,13 +46,18 @@ const FIRST_HANDSHAKE: Duration = Duration::from_secs(60);
 /// A tunnel that received any datagram within this window is alive.
 const RX_QUIET: Duration = Duration::from_secs(60);
 
-/// Self-heal decision. Rekey happens every 120 s, so handshake age up to
-/// REJECT_AFTER_TIME (180 s) is normal; also require recent inbound silence.
+/// Self-heal decision.
+///
+/// A tunnel with recent inbound traffic is alive: keepalives (25 s) prove it.
+/// Never recreate on a timer while `since_rx < RX_QUIET`. Handshake age alone
+/// is not a signal — WireGuard rekeys around 120 s, so ages up to ~180 s are
+/// normal. Only after inbound silence do we look at handshake age / timeout.
 pub(crate) fn rebind_reason(
     handshake_age_secs: Option<u64>,
     since_start: Duration,
     since_rx: Duration,
 ) -> Option<&'static str> {
+    // Living tunnel: do not touch, regardless of handshake age or wall clock.
     if since_rx < RX_QUIET {
         return None;
     }
@@ -602,6 +607,9 @@ mod tests {
     fn recent_rx_keeps_tunnel_even_if_handshake_old() {
         assert_eq!(rebind_reason(Some(400), S(600), S(10)), None);
         assert_eq!(rebind_reason(None, S(600), S(10)), None);
+        // Rekey window + absurd age: still no rebind while rx is fresh.
+        assert_eq!(rebind_reason(Some(999), S(10_000), S(0)), None);
+        assert_eq!(rebind_reason(Some(999), S(10_000), S(59)), None);
     }
 
     #[test]

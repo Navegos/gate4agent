@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-node-core"
-version = "0.5.14"
+version = "0.5.15"
 edition = "2021"
 description = "Transport core of the gate4agent node: platform endpoints, spawn profiles, userspace WireGuard"
 license = "MIT"
