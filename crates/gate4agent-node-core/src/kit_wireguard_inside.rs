@@ -86,14 +86,18 @@ fn supervisor_loop(config: NodeWgPeerConfig) {
     let _ = node_log::init_from_env();
     let mut backoff = Duration::from_secs(1);
     let mut live_stop: Option<Arc<AtomicBool>> = None;
+    let mut session_started: Option<StdInstant> = None;
 
     loop {
-        let stale = {
-            let st = wg_status::WgStatus::snapshot();
-            match st.handshake_age_secs {
-                None => live_stop.is_some(),
-                Some(age) => age >= HANDSHAKE_STALE.as_secs(),
-            }
+        let st = wg_status::WgStatus::snapshot();
+        // Only an established-but-old handshake is "stale". A missing
+        // handshake means we are still waiting — give it HANDSHAKE_STALE
+        // from session start before recreating the UDP socket.
+        let stale = match st.handshake_age_secs {
+            Some(age) => age >= HANDSHAKE_STALE.as_secs(),
+            None => session_started
+                .map(|t| t.elapsed() >= HANDSHAKE_STALE)
+                .unwrap_or(false),
         };
         let need_start = live_stop
             .as_ref()
@@ -104,14 +108,21 @@ fn supervisor_loop(config: NodeWgPeerConfig) {
                 stop.store(true, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(250));
             }
+            session_started = None;
             if stale && !need_start {
                 wg_status::set_rebinding();
                 wg_status::bump_rebind();
-                node_log::warn("wg_rebind", &[("reason", "handshake_stale".into())]);
+                let reason = if st.handshake_age_secs.is_some() {
+                    "handshake_stale"
+                } else {
+                    "handshake_timeout"
+                };
+                node_log::warn("wg_rebind", &[("reason", reason.into())]);
             }
             match start_session(&config) {
                 Ok(stop) => {
                     live_stop = Some(stop);
+                    session_started = Some(StdInstant::now());
                     wg_status::set_up();
                     backoff = Duration::from_secs(1);
                     node_log::info(
