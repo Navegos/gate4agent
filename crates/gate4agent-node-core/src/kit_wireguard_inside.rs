@@ -66,7 +66,7 @@ pub(super) fn start(
     config: &NodeWgPeerConfig,
     secret: StaticSecret,
     peer_key: PublicKey,
-    exit_if: u32,
+    exit_if: Option<u32>,
 ) -> Result<Arc<AtomicBool>, String> {
     let IpAddr::V4(local) = config.local_tunnel_address else {
         return Err("inside-existing tunnel is ipv4 only".to_owned());
@@ -81,7 +81,9 @@ pub(super) fn start(
         .map_err(|error| format!("udp bind: {error}"))?;
     udp.set_read_timeout(Some(Duration::from_millis(50)))
         .map_err(|error| format!("udp timeout: {error}"))?;
-    bind_v4_exit(&udp, exit_if)?;
+    if let Some(if_index) = exit_if {
+        bind_v4_exit(&udp, if_index)?;
+    }
     let index = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -105,7 +107,7 @@ pub(super) fn start(
     }
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
-    let exit_if_watch = exit_if;
+    let exit_if_watch = exit_if.unwrap_or(0);
     std::thread::Builder::new()
         .name("wg-inside".to_owned())
         .spawn(move || pump(local, peer, endpoint, udp, tunn, rx, stop_thread, exit_if_watch))

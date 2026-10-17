@@ -1,8 +1,9 @@
 //! Windows node↔C2 tunnel.
 //!
-//! - no tun owns the default route: open one adapter, host route for the peer only;
-//! - a tun already owns it: do not open an adapter and do not add a route.
-//!   WireGuard runs in this process. Its UDP leaves through the existing tun.
+//! Placement is decided by facts about the interface that carries traffic to
+//! the C2 public endpoint (ifType / hardware / split defaults), not by adapter
+//! names. A foreign tunnel → userspace WG inside it (no adapter). A physical
+//! path → WinTun host route, with a userspace fallback when elevation is missing.
 //!
 //! There is no default route and no edit of any other adapter.
 
@@ -25,9 +26,8 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 use crate::kit_wireguard::{NodeWgPeerConfig, NodeWgPeerError};
 use crate::kit_wireguard_placement::{
-    classify, nested_locked, opens_adapter, parse_route_lines, DefaultRoute, Placement,
+    decide, parse_route_facts, Placement, RouteFact,
 };
-
 
 const RING: u32 = 0x20000;
 const MTU: u16 = 1280;
@@ -51,14 +51,35 @@ pub(crate) fn connect_inside(addr: SocketAddr) -> std::io::Result<Option<std::ne
 }
 
 pub(crate) fn bring_up(config: &NodeWgPeerConfig) -> Result<(), NodeWgPeerError> {
-    // Supervisor owns retries, nested wait, and exit-if rebind. Bring-up
-    // failure must not take down the node process.
     let config = config.clone();
     std::thread::Builder::new()
         .name("wg-supervisor".to_owned())
         .spawn(move || supervisor_loop(config))
         .map_err(|error| NodeWgPeerError::Setup(format!("wireguard supervisor: {error}")))?;
     Ok(())
+}
+
+fn log_stats() {
+    use crate::node_log;
+    use crate::wg_status;
+    let st = wg_status::WgStatus::snapshot();
+    node_log::info(
+        "wg_stats",
+        &[
+            ("udp_out", st.udp_out.to_string()),
+            ("udp_in", st.udp_in.to_string()),
+            ("send_fail", st.send_fail.to_string()),
+            ("last_err", st.last_err.to_string()),
+            ("session", if st.handshake_age_secs.is_some() { "1" } else { "0" }.into()),
+            (
+                "handshake_age_secs",
+                st.handshake_age_secs
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".into()),
+            ),
+            ("state", st.state),
+        ],
+    );
 }
 
 fn supervisor_loop(config: NodeWgPeerConfig) {
@@ -73,53 +94,79 @@ fn supervisor_loop(config: NodeWgPeerConfig) {
     let mut backoff = Duration::from_secs(1);
     let mut live_stop: Option<Arc<AtomicBool>> = None;
     let mut live_if: Option<u32> = None;
-    let mut last_placement_key = String::new();
+    let mut last_key = String::new();
     let handshake_limit = Duration::from_secs(60);
+    let endpoint = config.peer_endpoint;
 
     loop {
-        let routes = read_default_routes().unwrap_or_else(|error| {
-            node_log::warn(
-                "wg_classify_failed",
-                &[("error", error)],
-            );
-            Vec::new()
-        });
-        let nested = nested_locked(env_nested_forced(), &routes, ever_nested);
-        if nested {
-            ever_nested = true;
-        }
-        let placement = classify(&routes, nested);
-        let placement_key = match &placement {
-            Placement::Open => "open".to_owned(),
-            Placement::WaitExitTun => "wait_exit_tun".to_owned(),
-            Placement::InsideExisting { if_index, alias, desc } => {
-                format!("inside:{if_index}:{alias}:{desc}")
+        let routes = match endpoint {
+            Some(ep) => read_endpoint_routes(ep).unwrap_or_else(|error| {
+                node_log::warn("wg_classify_failed", &[("error", error)]);
+                Vec::new()
+            }),
+            None => {
+                node_log::warn("wg_classify_failed", &[("error", "no peer endpoint".into())]);
+                Vec::new()
             }
         };
-        if placement_key != last_placement_key {
+        if routes.iter().any(|r| crate::kit_wireguard_placement::tunnel_reason(r).is_some()) {
+            ever_nested = true;
+        }
+        if env_nested_forced() {
+            ever_nested = true;
+        }
+        let decision = decide(&routes, ever_nested);
+        let key = match &decision.placement {
+            Placement::Open => format!("open:{}", decision.reason),
+            Placement::WaitExitTun => format!("wait:{}", decision.reason),
+            Placement::InsideExisting { if_index, alias, .. } => {
+                format!("inside:{if_index}:{alias}:{}", decision.reason)
+            }
+        };
+        if key != last_key {
             for r in &routes {
                 node_log::info(
                     "wg_classify_route",
                     &[
                         ("if_index", r.if_index.to_string()),
+                        ("prefix", r.prefix.clone()),
                         ("metric", r.metric.to_string()),
-                        ("tun", r.tun.to_string()),
+                        ("if_type", r.if_type.to_string()),
+                        (
+                            "hardware",
+                            r.hardware.map(|b| b.to_string()).unwrap_or_else(|| "none".into()),
+                        ),
+                        (
+                            "virtual",
+                            r.is_virtual.map(|b| b.to_string()).unwrap_or_else(|| "none".into()),
+                        ),
+                        ("media", r.media.clone()),
                         ("alias", r.alias.clone()),
                         ("desc", r.desc.clone()),
                     ],
                 );
             }
-            node_log::info(
-                "wg_classify",
-                &[
-                    ("placement", placement_key.clone()),
-                    ("nested", nested.to_string()),
-                ],
-            );
-            last_placement_key = placement_key;
+            let mut fields = vec![
+                ("placement", match &decision.placement {
+                    Placement::Open => "open".into(),
+                    Placement::WaitExitTun => "wait_exit_tun".into(),
+                    Placement::InsideExisting { .. } => "inside-existing".into(),
+                }),
+                ("reason", decision.reason.clone()),
+                ("nested", ever_nested.to_string()),
+            ];
+            if let Some(r) = &decision.route {
+                fields.push(("deciding_prefix", r.prefix.clone()));
+                fields.push(("deciding_if", r.if_index.to_string()));
+                fields.push(("deciding_if_type", r.if_type.to_string()));
+                fields.push(("alias", r.alias.clone()));
+                fields.push(("desc", r.desc.clone()));
+            }
+            node_log::info("wg_classify", &fields);
+            last_key = key;
         }
 
-        match placement {
+        match decision.placement {
             Placement::WaitExitTun => {
                 wg_status::set_waiting();
                 if let Some(stop) = live_stop.take() {
@@ -127,8 +174,10 @@ fn supervisor_loop(config: NodeWgPeerConfig) {
                     live_if = None;
                     node_log::warn("wg_pump_stopped", &[("reason", "exit_tun_gone".into())]);
                 }
+                log_stats();
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(Duration::from_secs(30));
+                last_key.clear();
                 continue;
             }
             Placement::InsideExisting { if_index, alias, desc } => {
@@ -146,7 +195,14 @@ fn supervisor_loop(config: NodeWgPeerConfig) {
                         stop.store(true, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(200));
                     }
-                    if if_changed && live_if.is_some() {
+                    let reason = if if_changed && live_if.is_some() {
+                        "if_index_changed"
+                    } else if stale {
+                        "handshake_stale"
+                    } else {
+                        "start"
+                    };
+                    if reason != "start" {
                         wg_status::set_rebinding();
                         wg_status::bump_rebind();
                         node_log::warn(
@@ -155,21 +211,13 @@ fn supervisor_loop(config: NodeWgPeerConfig) {
                                 ("old_if", live_if.unwrap_or(0).to_string()),
                                 ("new_if", if_index.to_string()),
                                 ("alias", alias.clone()),
-                                ("reason", if if_changed { "if_index_changed" } else { "handshake_stale" }.into()),
+                                ("reason", reason.into()),
                             ],
                         );
-                    } else if stale {
-                        node_log::warn(
-                            "wg_rebind",
-                            &[
-                                ("new_if", if_index.to_string()),
-                                ("alias", alias.clone()),
-                                ("reason", "handshake_stale".into()),
-                            ],
-                        );
-                        wg_status::bump_rebind();
                     }
-                    match start_inside(&config, if_index, &alias, &desc) {
+                    // Let the OS pick the exit interface: sticky IP_UNICAST_IF
+                    // breaks when the outer VPN recreates its adapter.
+                    match start_inside(&config, None, &alias, &desc) {
                         Ok(stop) => {
                             live_stop = Some(stop);
                             live_if = Some(if_index);
@@ -181,6 +229,7 @@ fn supervisor_loop(config: NodeWgPeerConfig) {
                                 &[
                                     ("variant", "inside-existing".into()),
                                     ("if_index", if_index.to_string()),
+                                    ("bind", "os-route".into()),
                                     ("alias", alias.clone()),
                                 ],
                             );
@@ -188,13 +237,12 @@ fn supervisor_loop(config: NodeWgPeerConfig) {
                         Err(error) => {
                             wg_status::set_down();
                             live_if = None;
+                            last_key.clear();
                             node_log::error(
                                 "wg_bring_up_err",
-                                &[
-                                    ("variant", "inside-existing".into()),
-                                    ("error", error),
-                                ],
+                                &[("variant", "inside-existing".into()), ("error", error)],
                             );
+                            log_stats();
                             std::thread::sleep(backoff);
                             backoff = (backoff * 2).min(Duration::from_secs(30));
                             continue;
@@ -203,25 +251,27 @@ fn supervisor_loop(config: NodeWgPeerConfig) {
                 }
             }
             Placement::Open => {
-                // Standalone WinTun path (no outer tun). Not used when nested.
-                if live_stop.is_none() {
-                    match start_open(&config) {
-                        Ok(stop) => {
+                if live_stop.as_ref().map_or(true, |s| s.load(Ordering::SeqCst)) {
+                    if let Some(stop) = live_stop.take() {
+                        stop.store(true, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    match start_open_or_userspace(&config) {
+                        Ok((stop, variant)) => {
                             live_stop = Some(stop);
                             live_if = None;
                             wg_status::set_up();
                             backoff = Duration::from_secs(1);
-                            node_log::info(
-                                "wg_bring_up_ok",
-                                &[("variant", "open".into())],
-                            );
+                            node_log::info("wg_bring_up_ok", &[("variant", variant)]);
                         }
                         Err(error) => {
                             wg_status::set_down();
+                            last_key.clear();
                             node_log::error(
                                 "wg_bring_up_err",
                                 &[("variant", "open".into()), ("error", error)],
                             );
+                            log_stats();
                             std::thread::sleep(backoff);
                             backoff = (backoff * 2).min(Duration::from_secs(30));
                             continue;
@@ -232,30 +282,13 @@ fn supervisor_loop(config: NodeWgPeerConfig) {
         }
 
         std::thread::sleep(Duration::from_secs(5));
-        let st = wg_status::WgStatus::snapshot();
-        node_log::info(
-            "wg_stats",
-            &[
-                ("udp_out", st.udp_out.to_string()),
-                ("udp_in", st.udp_in.to_string()),
-                ("send_fail", st.send_fail.to_string()),
-                ("last_err", st.last_err.to_string()),
-                ("session", if st.handshake_age_secs.is_some() { "1" } else { "0" }.into()),
-                (
-                    "handshake_age_secs",
-                    st.handshake_age_secs
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "none".into()),
-                ),
-                ("state", st.state),
-            ],
-        );
+        log_stats();
     }
 }
 
 fn start_inside(
     config: &NodeWgPeerConfig,
-    if_index: u32,
+    exit_if: Option<u32>,
     alias: &str,
     _desc: &str,
 ) -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>, String> {
@@ -264,18 +297,45 @@ fn start_inside(
         "wg_start_inside",
         &[
             ("exit", alias.to_owned()),
-            ("if_index", if_index.to_string()),
+            (
+                "if_index",
+                exit_if.map(|v| v.to_string()).unwrap_or_else(|| "os-route".into()),
+            ),
             ("adapter", "none".into()),
         ],
     );
-    inside::start(config, secret, peer_key, if_index)
+    inside::start(config, secret, peer_key, exit_if)
+}
+
+/// Prefer WinTun; on elevation / create failure fall back to userspace (no adapter).
+fn start_open_or_userspace(
+    config: &NodeWgPeerConfig,
+) -> Result<(std::sync::Arc<std::sync::atomic::AtomicBool>, String), String> {
+    match start_open(config) {
+        Ok(stop) => Ok((stop, "open".into())),
+        Err(error) => {
+            let elev = error.contains("(5)")
+                || error.to_ascii_lowercase().contains("elevation")
+                || error.to_ascii_lowercase().contains("access is denied")
+                || error.to_ascii_lowercase().contains("wintun create");
+            if elev {
+                crate::node_log::warn(
+                    "wg_open_fallback_userspace",
+                    &[("error", error)],
+                );
+                let stop = start_inside(config, None, "os-route", "")?;
+                Ok((stop, "open-userspace-fallback".into()))
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 fn start_open(config: &NodeWgPeerConfig) -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>, String> {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
-    let (secret, peer_key) =
-        load_keys(&config.private_key_path, &config.peer_public_key).map_err(|e| e)?;
+    let (secret, peer_key) = load_keys(&config.private_key_path, &config.peer_public_key)?;
     let mut live = LiveTun::open(&config.interface_name)?;
     assign_host_route(
         &config.interface_name,
@@ -428,32 +488,93 @@ fn bind_v4_exit(udp: &UdpSocket, if_index: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn read_default_routes() -> Result<Vec<DefaultRoute>, String> {
-    let script = r#"
-$ErrorActionPreference = 'SilentlyContinue'
-Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | ForEach-Object {
-  $a = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue
-  $desc = ''
-  if ($null -ne $a) { $desc = [string]$a.InterfaceDescription }
-  $alias = [string]$_.InterfaceAlias
-  $blob = ($alias + ' ' + $desc).ToLowerInvariant()
-  $tun = 0
-  foreach ($n in @('wintun','wireguard','amnezia','tailscale','tap-windows')) {
-    if ($blob.Contains($n)) { $tun = 1 }
-  }
-  $safe = if ($alias -match '^[A-Za-z0-9 _\-\.\(\)]+$') { $alias } else { '-' }
-  $dsafe = if ($desc -match '^[A-Za-z0-9 _\-\.\(\)]+$') { $desc } else { '-' }
-  Write-Output ('{0} {1} {2} {3}' + [char]9 + '{4}' -f [int]$_.InterfaceIndex, [int]$_.RouteMetric, $tun, $safe, $dsafe)
-}
-"#;
+/// Routes that can carry packets to `endpoint`, with adapter facts.
+/// Written by PowerShell into a UTF-8 temp file (avoids the UTF-16 pipe trap).
+fn read_endpoint_routes(endpoint: SocketAddr) -> Result<Vec<RouteFact>, String> {
+    let host = match endpoint.ip() {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => ip.to_string(),
+    };
+    let out_path = std::env::temp_dir().join(format!(
+        "g4a-wg-routes-{}-{}.tsv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let out_ps = out_path.display().to_string().replace('\'', "''");
+    let script = endpoint_route_script(&host, &out_ps);
     let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .map_err(|error| error.to_string())?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        let err = stdout_text(&output.stderr);
+        let _ = std::fs::remove_file(&out_path);
+        return Err(err.trim().to_owned());
     }
-    Ok(parse_route_lines(&stdout_text(&output.stdout)))
+    let bytes = std::fs::read(&out_path).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&out_path);
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(parse_route_facts(&text))
+}
+
+fn endpoint_route_script(host: &str, out_ps: &str) -> String {
+    let host = host.replace('\'', "''");
+    format!(
+        r#"$ErrorActionPreference = 'SilentlyContinue'
+$dest = '{host}'
+$out = '{out}'
+$utf8 = New-Object System.Text.UTF8Encoding $false
+$rows = New-Object System.Collections.Generic.List[string]
+function Emit($r) {{
+  if ($null -eq $r) {{ return }}
+  $idx = [int]$r.InterfaceIndex
+  $prefix = [string]$r.DestinationPrefix
+  $metric = [int]$r.RouteMetric
+  $a = Get-NetAdapter -InterfaceIndex $idx -IncludeHidden -ErrorAction SilentlyContinue
+  $ifType = 0; $hw = ''; $virt = ''; $media = ''; $alias = '-'; $desc = '-'
+  if ($null -ne $a) {{
+    try {{ $ifType = [int]$a.InterfaceType }} catch {{}}
+    if ($null -ne $a.HardwareInterface) {{ $hw = if ($a.HardwareInterface) {{ 'True' }} else {{ 'False' }} }}
+    try {{ if ($null -ne $a.Virtual) {{ $virt = if ($a.Virtual) {{ 'True' }} else {{ 'False' }} }} }} catch {{}}
+    try {{ $media = [string]$a.MediaType }} catch {{}}
+    $alias = [string]$a.InterfaceAlias
+    $desc = [string]$a.InterfaceDescription
+  }} else {{
+    $alias = [string]$r.InterfaceAlias
+    if ([string]::IsNullOrWhiteSpace($alias)) {{ $alias = '-' }}
+  }}
+  if ($alias -match '[	
+]') {{ $alias = '-' }}
+  if ($desc -match '[	
+]') {{ $desc = '-' }}
+  if ($media -match '[	
+]') {{ $media = '-' }}
+  $rows.Add(('{{0}}{{9}}{{1}}{{9}}{{2}}{{9}}{{3}}{{9}}{{4}}{{9}}{{5}}{{9}}{{6}}{{9}}{{7}}{{9}}{{8}}' -f $idx, $prefix, $metric, $ifType, $hw, $virt, $media, $alias, $desc, [char]9))
+}}
+Get-NetRoute -AddressFamily IPv4 -DestinationPrefix "$dest/32" -ErrorAction SilentlyContinue | ForEach-Object {{ Emit $_ }}
+try {{
+  $best = Find-NetRoute -RemoteIPAddress $dest -ErrorAction SilentlyContinue
+  if ($null -ne $best) {{
+    $br = @($best)[0]
+    $idx = [int]$br.InterfaceIndex
+    if ($idx -gt 0) {{
+      $a = Get-NetAdapter -InterfaceIndex $idx -IncludeHidden -ErrorAction SilentlyContinue
+      $fake = [pscustomobject]@{{ InterfaceIndex = $idx; DestinationPrefix = "$dest/32"; RouteMetric = 0; InterfaceAlias = $(if ($a) {{ $a.InterfaceAlias }} else {{ '-' }}) }}
+      Emit $fake
+    }}
+  }}
+}} catch {{}}
+Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' | ForEach-Object {{ Emit $_ }}
+Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/1' | ForEach-Object {{ Emit $_ }}
+Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '128.0.0.0/1' | ForEach-Object {{ Emit $_ }}
+[IO.File]::WriteAllLines($out, $rows.ToArray(), $utf8)
+"#,
+        host = host,
+        out = out_ps,
+    )
 }
 
 fn stdout_text(bytes: &[u8]) -> String {
