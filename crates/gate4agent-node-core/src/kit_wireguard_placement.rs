@@ -8,12 +8,6 @@ const IFTYPE_TUNNEL: u32 = 131;
 const IFTYPE_PPP: u32 = 23;
 const IFTYPE_SOFTWARE_LOOPBACK: u32 = 24;
 const IFTYPE_ETHERNET: u32 = 6;
-const IFTYPE_WIFI: u32 = 71;
-
-/// Name fragments used only as a secondary hint.
-const NAME_HINTS: [&str; 8] = [
-    "wintun", "wireguard", "tun", "tap", "vpn", "tunnel", "virtual", "ppp",
-];
 
 /// One route candidate toward the C2 endpoint with facts about its interface.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,12 +96,6 @@ pub fn tunnel_reason(route: &RouteFact) -> Option<String> {
         && (media.contains("tunnel") || (media.contains("ip") && !media.contains("802")))
     {
         return Some(format!("media={}", route.media));
-    }
-    let blob = format!("{} {}", route.alias, route.desc).to_ascii_lowercase();
-    if route.if_type != IFTYPE_ETHERNET && route.if_type != IFTYPE_WIFI {
-        if let Some(hint) = NAME_HINTS.iter().find(|h| blob.contains(*h)) {
-            return Some(format!("name hint '{hint}'"));
-        }
     }
     None
 }
@@ -250,11 +238,12 @@ mod tests {
     }
 
     #[test]
-    fn name_is_only_a_hint_for_unknown_type() {
-        let mut f = fact(9, "0.0.0.0/0", 1, IFTYPE_ETHERNET, Some(true), "My VPN");
+    fn names_are_ignored() {
+        let mut f = fact(9, "0.0.0.0/0", 1, IFTYPE_ETHERNET, Some(true), "My VPN Tunnel");
+        f.desc = "Virtual TAP".into();
         assert_eq!(tunnel_reason(&f), None);
         f.if_type = 0;
-        assert!(tunnel_reason(&f).unwrap().contains("name hint"));
+        assert_eq!(tunnel_reason(&f), None);
     }
 
     #[test]
