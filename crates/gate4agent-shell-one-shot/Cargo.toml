@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-shell-one-shot"
-version = "0.5.9"
+version = "0.5.10"
 edition = "2021"
 description = "Bounded native process authority for provider-owned gate4agent one-shot runs"
 license = "MIT"

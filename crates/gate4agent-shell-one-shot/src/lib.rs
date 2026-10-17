@@ -689,6 +689,12 @@ fn has_unsafe_windows_batch_syntax(value: &str) -> bool {
     })
 }
 
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
 fn configure_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -698,8 +704,6 @@ fn configure_process_group(command: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         command
             .as_std_mut()
             .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);

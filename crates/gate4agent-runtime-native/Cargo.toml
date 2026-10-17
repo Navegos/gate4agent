@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent-runtime-native"
-version = "0.5.8"
+version = "0.5.9"
 edition = "2021"
 description = "Tick-driven native runtime that embeds the gate4agent provider stack in an owning app core"
 license = "MIT"
@@ -12,8 +12,8 @@ gate4agent-handle = { path = "../gate4agent-handle", version = "0.5.8" }
 gate4agent-kernel = { path = "../gate4agent-kernel", version = "0.5.8" }
 gate4agent-provider-ports = { path = "../gate4agent-provider-ports", version = "0.5.8" }
 gate4agent-shell-history = { path = "../gate4agent-shell-history", version = "0.5.8" }
-gate4agent-shell-capabilities = { path = "../gate4agent-shell-capabilities", version = "0.5.8" }
-gate4agent-shell-native = { path = "../gate4agent-shell-native", version = "0.5.8" }
+gate4agent-shell-capabilities = { path = "../gate4agent-shell-capabilities", version = "0.5.10" }
+gate4agent-shell-native = { path = "../gate4agent-shell-native", version = "0.5.9" }
 gate4agent-tool-engine = { path = "../gate4agent-tool-engine", version = "0.5.8" }
 gate4agent-types = { path = "../gate4agent-types", version = "0.5.8" }
 thiserror = "2"

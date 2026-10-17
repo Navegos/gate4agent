@@ -265,6 +265,11 @@ fn native_command(program: &str, args: &[String]) -> Command {
     command
 }
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
 fn configure_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -274,8 +279,6 @@ fn configure_process_group(command: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         command
             .as_std_mut()
             .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
@@ -285,10 +288,9 @@ fn configure_process_group(command: &mut Command) {
 async fn terminate_process_tree(process_id: u32) {
     #[cfg(windows)]
     let mut command = {
-        use std::os::windows::process::CommandExt;
         let mut command = Command::new("taskkill.exe");
         command.args(["/PID", &process_id.to_string(), "/T", "/F"]);
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        command.creation_flags(CREATE_NO_WINDOW);
         command
     };
     #[cfg(unix)]
