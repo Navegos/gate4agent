@@ -6,6 +6,9 @@ pub mod drive_loop_profile;
 pub mod platform;
 pub mod session_registry;
 pub mod spawn_spec;
+pub mod node_log;
+pub mod wg_status;
+pub mod kit_wireguard_placement;
 #[cfg(feature = "wireguard")]
 pub mod kit_wireguard;
 #[cfg(all(feature = "wireguard", windows))]

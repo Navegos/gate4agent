@@ -5,8 +5,9 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TryRecvError};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
 use boringtun::noise::{Tunn, TunnResult};
@@ -31,7 +32,7 @@ struct Job {
     listener: TcpListener,
 }
 
-static GATE: OnceLock<Gate> = OnceLock::new();
+static GATE: Mutex<Option<Gate>> = Mutex::new(None);
 
 /// Idle time before the inner (in-tunnel) TCP socket sends a keepalive.
 const INNER_KEEPALIVE: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(15);
@@ -39,7 +40,8 @@ const INNER_KEEPALIVE: smoltcp::time::Duration = smoltcp::time::Duration::from_s
 const INNER_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(45);
 
 pub(super) fn connect(addr: SocketAddr) -> std::io::Result<Option<TcpStream>> {
-    let Some(gate) = GATE.get() else {
+    let guard = GATE.lock().map_err(|_| std::io::Error::other("wireguard gate lock"))?;
+    let Some(gate) = guard.as_ref() else {
         return Ok(None);
     };
     if addr.ip() != gate.peer {
@@ -54,6 +56,7 @@ pub(super) fn connect(addr: SocketAddr) -> std::io::Result<Option<TcpStream>> {
             listener,
         })
         .map_err(|_| std::io::Error::other("wireguard session is gone"))?;
+    drop(guard);
     let stream = TcpStream::connect_timeout(&local, Duration::from_secs(20))?;
     stream.set_nodelay(true)?;
     Ok(Some(stream))
@@ -64,7 +67,7 @@ pub(super) fn start(
     secret: StaticSecret,
     peer_key: PublicKey,
     exit_if: u32,
-) -> Result<(), String> {
+) -> Result<Arc<AtomicBool>, String> {
     let IpAddr::V4(local) = config.local_tunnel_address else {
         return Err("inside-existing tunnel is ipv4 only".to_owned());
     };
@@ -96,16 +99,18 @@ pub(super) fn start(
         peer: config.peer_tunnel_address,
         jobs: tx,
     };
-    if GATE.set(gate).is_err() {
-        return Err("wireguard session is already up".to_owned());
+    {
+        let mut slot = GATE.lock().map_err(|_| "wireguard gate lock".to_owned())?;
+        *slot = Some(gate);
     }
-    let keepalive = config.persistent_keepalive_secs;
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let exit_if_watch = exit_if;
     std::thread::Builder::new()
         .name("wg-inside".to_owned())
-        .spawn(move || pump(local, peer, endpoint, udp, tunn, rx, keepalive))
+        .spawn(move || pump(local, peer, endpoint, udp, tunn, rx, stop_thread, exit_if_watch))
         .map_err(|error| format!("wireguard thread: {error}"))?;
-    let _ = keepalive;
-    Ok(())
+    Ok(stop)
 }
 
 struct Link {
@@ -174,7 +179,8 @@ fn pump(
     udp: UdpSocket,
     mut tunn: Tunn,
     jobs: std::sync::mpsc::Receiver<Job>,
-    _keepalive: u16,
+    stop: Arc<AtomicBool>,
+    exit_if: u32,
 ) {
     let mut device = IpDev {
         rx: VecDeque::new(),
@@ -207,6 +213,13 @@ fn pump(
         send_out(&udp, endpoint, tunn.format_handshake_initiation(&mut net_buf, false)),
     );
     loop {
+        if stop.load(Ordering::SeqCst) {
+            if let Ok(mut slot) = GATE.lock() {
+                *slot = None;
+            }
+            crate::wg_status::set_down();
+            return;
+        }
         loop {
             match jobs.try_recv() {
                 Ok(job) => pending.push_back(job),
@@ -318,11 +331,16 @@ fn pump(
                     ),
                 );
             }
-            let inner = links.len();
-            let session = u8::from(tunn.time_since_last_handshake().is_some());
-            eprintln!(
-                "wireguard: inside udp_out={udp_out} udp_in={udp_in} send_fail={send_fail} last_err={last_err} session={session} streams={inner}"
-            );
+            let age = tunn
+                .time_since_last_handshake()
+                .map(|d| d.as_secs());
+            crate::wg_status::publish_stats(udp_out, udp_in, send_fail, last_err, age);
+            crate::wg_status::set_exit_if(exit_if);
+            if age.is_some() {
+                crate::wg_status::set_up();
+            }
+            let _ = links.len();
+            let _ = exit_if;
             reported = StdInstant::now();
         }
         let mut keep = Vec::new();

@@ -13,6 +13,8 @@ use std::process::Command;
 
 use thiserror::Error;
 
+pub use crate::wg_status::WgStatus;
+
 /// Link tag so the kit binary retains this module.
 pub const LINK_TAG: &str = "kernel-wireguard-node-c2-peer";
 
@@ -110,20 +112,93 @@ pub enum NodeWgPeerError {
 pub fn bring_up_node_wireguard(config: &NodeWgPeerConfig) -> Result<IpAddr, NodeWgPeerError> {
     config.validate()?;
     require_key_file(&config.private_key_path)?;
+    let _ = crate::node_log::init_from_env();
     #[cfg(windows)]
     {
+        // Supervisor retries forever; this call only starts it.
         crate::kit_wireguard_windows::bring_up(config)?;
+        crate::node_log::info(
+            "wg_supervisor_started",
+            &[("iface", config.interface_name.clone())],
+        );
         return Ok(config.peer_tunnel_address);
     }
     #[cfg(not(windows))]
     {
-        create_wireguard_iface(&config.interface_name)?;
-        if let Err(error) = configure_wireguard(config) {
-            delete_iface(&config.interface_name);
-            return Err(error);
+        match bring_up_linux(config) {
+            Ok(ip) => {
+                crate::wg_status::set_up();
+                crate::node_log::info(
+                    "wg_bring_up_ok",
+                    &[("variant", "kernel".into()), ("iface", config.interface_name.clone())],
+                );
+                Ok(ip)
+            }
+            Err(error) => {
+                crate::wg_status::set_down();
+                crate::node_log::error(
+                    "wg_bring_up_err",
+                    &[
+                        ("variant", "kernel".into()),
+                        ("error", error.to_string()),
+                    ],
+                );
+                Err(error)
+            }
         }
-        Ok(config.peer_tunnel_address)
     }
+}
+
+/// Spawn a background retry loop for Linux kernel WireGuard. The node process
+/// stays up while the tunnel is down (`WgStatus` reports `down`).
+pub fn spawn_linux_wireguard_retry(config: NodeWgPeerConfig) {
+    #[cfg(windows)]
+    {
+        let _ = config;
+    }
+    #[cfg(not(windows))]
+    {
+        std::thread::Builder::new()
+            .name("wg-linux-retry".into())
+            .spawn(move || {
+                let mut backoff = std::time::Duration::from_secs(1);
+                loop {
+                    match bring_up_linux(&config) {
+                        Ok(_) => {
+                            crate::wg_status::set_up();
+                            crate::node_log::info(
+                                "wg_bring_up_ok",
+                                &[("variant", "kernel".into()), ("iface", config.interface_name.clone())],
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            crate::wg_status::set_down();
+                            crate::node_log::warn(
+                                "wg_retry",
+                                &[
+                                    ("error", error.to_string()),
+                                    ("backoff_secs", backoff.as_secs().to_string()),
+                                ],
+                            );
+                            std::thread::sleep(backoff);
+                            backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
+}
+
+#[cfg(not(windows))]
+fn bring_up_linux(config: &NodeWgPeerConfig) -> Result<IpAddr, NodeWgPeerError> {
+    create_wireguard_iface(&config.interface_name)?;
+    if let Err(error) = configure_wireguard(config) {
+        delete_iface(&config.interface_name);
+        return Err(error);
+    }
+    Ok(config.peer_tunnel_address)
 }
 
 /// Dial `addr`. When this process already has an in-process WireGuard session
