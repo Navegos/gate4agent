@@ -285,8 +285,10 @@ fn configure_process_group(command: &mut Command) {
 async fn terminate_process_tree(process_id: u32) {
     #[cfg(windows)]
     let mut command = {
+        use std::os::windows::process::CommandExt;
         let mut command = Command::new("taskkill.exe");
         command.args(["/PID", &process_id.to_string(), "/T", "/F"]);
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         command
     };
     #[cfg(unix)]

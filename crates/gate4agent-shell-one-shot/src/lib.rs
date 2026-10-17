@@ -711,6 +711,7 @@ async fn terminate_process_tree(process_id: u32) {
     let mut command = {
         let mut command = Command::new("taskkill.exe");
         command.args(["/PID", &process_id.to_string(), "/T", "/F"]);
+        command.creation_flags(CREATE_NO_WINDOW);
         command
     };
     #[cfg(unix)]
