@@ -25,12 +25,18 @@ use crate::kit_wireguard::{NodeWgPeerConfig, NodeWgPeerError};
 
 struct Gate {
     peer: IpAddr,
-    jobs: SyncSender<Job>,
+    jobs: SyncSender<PumpMsg>,
 }
 
 struct Job {
     port: u16,
     listener: TcpListener,
+}
+
+enum PumpMsg {
+    Tcp(Job),
+    /// Inner UDP datagram toward the peer (PTY data plane).
+    Udp { dst_port: u16, payload: Vec<u8> },
 }
 
 static GATE: Mutex<Option<Gate>> = Mutex::new(None);
@@ -45,6 +51,8 @@ const HANDSHAKE_STALE: Duration = Duration::from_secs(180);
 const FIRST_HANDSHAKE: Duration = Duration::from_secs(60);
 /// A tunnel that received any datagram within this window is alive.
 const RX_QUIET: Duration = Duration::from_secs(60);
+/// Max UDP payload that fits the inner IP MTU (1280 − 20 − 8).
+pub(super) const INNER_UDP_MAX_PAYLOAD: usize = 1280 - 20 - 8;
 
 /// Self-heal decision.
 ///
@@ -85,15 +93,47 @@ pub(super) fn connect(addr: SocketAddr) -> std::io::Result<Option<TcpStream>> {
     listener.set_nonblocking(true)?;
     let local = listener.local_addr()?;
     gate.jobs
-        .send(Job {
+        .send(PumpMsg::Tcp(Job {
             port: addr.port(),
             listener,
-        })
+        }))
         .map_err(|_| std::io::Error::other("wireguard session is gone"))?;
     drop(guard);
     let stream = TcpStream::connect_timeout(&local, Duration::from_secs(20))?;
     stream.set_nodelay(true)?;
     Ok(Some(stream))
+}
+
+/// Send one UDP datagram to `addr` inside the userspace tunnel.
+/// Returns `Ok(None)` when no session is up or the address is not the peer.
+/// Payload must fit the inner MTU (see [`INNER_UDP_MAX_PAYLOAD`]).
+pub(super) fn udp_send(addr: SocketAddr, payload: &[u8]) -> std::io::Result<Option<()>> {
+    if payload.len() > INNER_UDP_MAX_PAYLOAD {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "udp payload {} exceeds inner MTU max {}",
+                payload.len(),
+                INNER_UDP_MAX_PAYLOAD
+            ),
+        ));
+    }
+    let guard = GATE
+        .lock()
+        .map_err(|_| std::io::Error::other("wireguard gate lock"))?;
+    let Some(gate) = guard.as_ref() else {
+        return Ok(None);
+    };
+    if addr.ip() != gate.peer {
+        return Ok(None);
+    }
+    gate.jobs
+        .send(PumpMsg::Udp {
+            dst_port: addr.port(),
+            payload: payload.to_vec(),
+        })
+        .map_err(|_| std::io::Error::other("wireguard session is gone"))?;
+    Ok(Some(()))
 }
 
 /// Spawn the forever supervisor: userspace pump with self-heal on stale handshake.
@@ -243,7 +283,7 @@ fn start(
         Some(25)
     };
     let tunn = Tunn::new(secret, peer_key, None, keepalive, index, None);
-    let (tx, rx) = sync_channel(8);
+    let (tx, rx) = sync_channel(256);
     let gate = Gate {
         peer: config.peer_tunnel_address,
         jobs: tx,
@@ -345,7 +385,7 @@ fn pump(
     endpoint: SocketAddr,
     udp: UdpSocket,
     mut tunn: Tunn,
-    jobs: std::sync::mpsc::Receiver<Job>,
+    jobs: std::sync::mpsc::Receiver<PumpMsg>,
     stop: Arc<AtomicBool>,
 ) {
     let mut device = IpDev {
@@ -365,6 +405,8 @@ fn pump(
     let mut links: Vec<Link> = Vec::new();
     let mut pending: VecDeque<Job> = VecDeque::new();
     let mut next_port: u16 = 20_000;
+    let mut udp_src_port: u16 = 40_000;
+    let mut pending_udp: VecDeque<(u16, Vec<u8>)> = VecDeque::new();
     let mut net_buf = [0u8; 2048];
     let mut tun_buf = [0u8; 2048];
     let mut udp_out = 0u64;
@@ -392,9 +434,21 @@ fn pump(
         }
         loop {
             match jobs.try_recv() {
-                Ok(job) => pending.push_back(job),
+                Ok(PumpMsg::Tcp(job)) => pending.push_back(job),
+                Ok(PumpMsg::Udp { dst_port, payload }) => pending_udp.push_back((dst_port, payload)),
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
+        }
+        while let Some((dst_port, payload)) = pending_udp.pop_front() {
+            let src_port = udp_src_port;
+            udp_src_port = udp_src_port.wrapping_add(1).max(40_000);
+            let packet = craft_ipv4_udp(local, peer, src_port, dst_port, &payload);
+            note_send(
+                &mut udp_out,
+                &mut send_fail,
+                &mut last_err,
+                send_out(&udp, endpoint, tunn.encapsulate(&packet, &mut net_buf)),
+            );
         }
         note_send(
             &mut udp_out,
@@ -622,4 +676,69 @@ mod tests {
         assert_eq!(rebind_reason(None, S(30), S(90)), None);
         assert_eq!(rebind_reason(None, S(60), S(60)), Some("handshake_timeout"));
     }
+}
+
+fn craft_ipv4_udp(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+    let udp_len = 8 + payload.len();
+    let total = 20 + udp_len;
+    let mut out = vec![0u8; total];
+    out[0] = 0x45; // v4, ihl=5
+    out[2] = (total >> 8) as u8;
+    out[3] = (total & 0xff) as u8;
+    out[8] = 64; // ttl
+    out[9] = 17; // UDP
+    out[12..16].copy_from_slice(&src.octets());
+    out[16..20].copy_from_slice(&dst.octets());
+    let ip_sum = ipv4_checksum(&out[..20]);
+    out[10] = (ip_sum >> 8) as u8;
+    out[11] = (ip_sum & 0xff) as u8;
+    out[20] = (src_port >> 8) as u8;
+    out[21] = (src_port & 0xff) as u8;
+    out[22] = (dst_port >> 8) as u8;
+    out[23] = (dst_port & 0xff) as u8;
+    out[24] = (udp_len >> 8) as u8;
+    out[25] = (udp_len & 0xff) as u8;
+    out[28..].copy_from_slice(payload);
+    let udp_sum = udp_checksum(src, dst, &out[20..]);
+    out[26] = (udp_sum >> 8) as u8;
+    out[27] = (udp_sum & 0xff) as u8;
+    out
+}
+
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in header.chunks(2) {
+        let word = if chunk.len() == 2 {
+            u16::from_be_bytes([chunk[0], chunk[1]])
+        } else {
+            u16::from_be_bytes([chunk[0], 0])
+        };
+        sum += u32::from(word);
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn udp_checksum(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for o in src.octets().chunks(2).chain(dst.octets().chunks(2)) {
+        sum += u32::from(u16::from_be_bytes([o[0], o[1]]));
+    }
+    sum += u32::from(17u16); // protocol
+    sum += u32::from(udp.len() as u16);
+    for chunk in udp.chunks(2) {
+        let word = if chunk.len() == 2 {
+            u16::from_be_bytes([chunk[0], chunk[1]])
+        } else {
+            u16::from_be_bytes([chunk[0], 0])
+        };
+        sum += u32::from(word);
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let c = !(sum as u16);
+    if c == 0 { 0xffff } else { c }
 }

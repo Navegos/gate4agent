@@ -232,6 +232,29 @@ pub fn tcp_connect(addr: SocketAddr) -> std::io::Result<std::net::TcpStream> {
     std::net::TcpStream::connect(addr)
 }
 
+/// Send one UDP datagram to `addr`.
+///
+/// With a live userspace WireGuard session for that peer tunnel address the
+/// datagram rides inside the tunnel (same path as [`tcp_connect`]). Otherwise
+/// this is a plain OS UDP send (kernel WireGuard / native route).
+///
+/// Payload must fit the userspace inner MTU (~1252 bytes). Oversized payloads
+/// return `InvalidInput` so callers can fall back to TCP.
+pub fn udp_send(addr: SocketAddr, payload: &[u8]) -> std::io::Result<()> {
+    match userspace::udp_send(addr, payload)? {
+        Some(()) => Ok(()),
+        None => {
+            let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+            sock.connect(addr)?;
+            sock.send(payload)?;
+            Ok(())
+        }
+    }
+}
+
+/// Max UDP payload accepted by [`udp_send`] on the userspace path.
+pub const WG_UDP_MAX_PAYLOAD: usize = userspace::INNER_UDP_MAX_PAYLOAD;
+
 fn require_key_file(path: &Path) -> Result<(), NodeWgPeerError> {
     let meta = std::fs::metadata(path).map_err(|error| {
         NodeWgPeerError::Setup(format!("private key path {}: {error}", path.display()))
