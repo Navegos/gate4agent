@@ -2100,7 +2100,7 @@ impl Gate4AgentEngine {
             .ok_or(ControlError::UnknownInstance { instance_id })?;
         if !matches!(
             state.snapshot.transport,
-            TransportKind::Pty | TransportKind::Pipe
+            TransportKind::Pty | TransportKind::Pipe | TransportKind::Acp
         ) {
             return Err(ControlError::UnsupportedTransportOperation {
                 transport: state.snapshot.transport,
@@ -7676,6 +7676,88 @@ mod tests {
     }
 
     #[test]
+    fn acp_resume_requires_matching_authority() {
+        let mut engine = Gate4AgentEngine::new();
+        engine.apply_command(register(1)).unwrap();
+        engine.session_mut(instance()).transport = TransportKind::Acp;
+        engine.drain_events();
+        let identity = ProviderSessionIdentity {
+            key: ProviderSessionKey::SessionId,
+            id: "durable-provider-session".to_owned(),
+            transcript_path: None,
+        };
+        engine
+            .apply_command(CommandEnvelope {
+                id: CommandId(2),
+                command: ControlCommand::Resume {
+                    instance_id: instance(),
+                    runtime_policy: verified_runtime_policy(),
+                    target: ResumeTarget::ProviderSession {
+                        identity: identity.clone(),
+                    },
+                    request: ResumeLaunchRequest {
+                        working_directory: ".".to_owned(),
+                        terminal_size: TerminalSize {
+                            rows: 24,
+                            columns: 80,
+                        },
+                        initial_prompt: None,
+                    },
+                },
+            })
+            .unwrap();
+        let authorize = engine.drain_effects().pop().unwrap();
+        assert!(matches!(
+            &authorize.effect,
+            ControlEffect::AuthorizeResume {
+                target: ResumeAuthorityTarget::ProviderSession { identity: requested },
+                ..
+            } if requested == &identity
+        ));
+        assert_eq!(engine.snapshot().sessions[0].provider.session, None);
+        assert_eq!(
+            engine.snapshot().sessions[0].status,
+            SessionStatus::Registered
+        );
+
+        engine.apply_observation(ObservationEnvelope {
+            operation_id: Some(authorize.operation_id),
+            instance_id: instance(),
+            generation: authorize.generation,
+            observation: ControlObservation::ResumeAuthorized {
+                provider_session: ProviderSessionIdentity {
+                    key: ProviderSessionKey::SessionId,
+                    id: "wrong-provider-session".to_owned(),
+                    transcript_path: None,
+                },
+            },
+        });
+        assert!(engine.drain_effects().is_empty());
+        assert_eq!(
+            engine.snapshot().sessions[0].status,
+            SessionStatus::Registered
+        );
+
+        engine.apply_observation(ObservationEnvelope {
+            operation_id: Some(authorize.operation_id),
+            instance_id: instance(),
+            generation: authorize.generation,
+            observation: ControlObservation::ResumeAuthorized {
+                provider_session: identity.clone(),
+            },
+        });
+        let spawn = engine.drain_effects().pop().unwrap();
+        assert_eq!(spawn.generation, SessionGeneration(1));
+        assert!(matches!(
+            spawn.effect,
+            ControlEffect::SpawnResume {
+                provider_session,
+                ..
+            } if provider_session == identity
+        ));
+    }
+
+    #[test]
     fn pipe_resume_requires_and_preserves_a_normalized_initial_prompt() {
         let (mut engine, identity) = inactive_engine_with_provider_session();
         engine.session_mut(instance()).transport = TransportKind::Pipe;
@@ -7699,29 +7781,6 @@ mod tests {
         assert_eq!(missing_prompt, Err(ControlError::MissingInitialPrompt));
         assert!(engine.drain_effects().is_empty());
 
-        engine.session_mut(instance()).transport = TransportKind::Acp;
-        assert!(matches!(
-            engine.apply_command(CommandEnvelope {
-                id: CommandId(21),
-                command: ControlCommand::Resume {
-                    instance_id: instance(),
-                    runtime_policy: verified_runtime_policy(),
-                    target: ResumeTarget::CurrentProvider,
-                    request: ResumeLaunchRequest {
-                        working_directory: ".".to_owned(),
-                        terminal_size: TerminalSize {
-                            rows: 24,
-                            columns: 80,
-                        },
-                        initial_prompt: Some("continue".to_owned()),
-                    },
-                },
-            }),
-            Err(ControlError::UnsupportedTransportOperation {
-                transport: TransportKind::Acp,
-                ..
-            })
-        ));
         engine.session_mut(instance()).transport = TransportKind::Pipe;
 
         engine

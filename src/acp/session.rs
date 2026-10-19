@@ -891,6 +891,19 @@ impl AcpSession {
         })
     }
 
+    /// Names of advertised capabilities, excluding all capability values.
+    pub fn capability_names(&self) -> Vec<String> {
+        // Log capability names only; never initialize values or agent/auth metadata.
+        let mut capability_names: Vec<String> = self.agent_caps.agent_capabilities.extra.keys().cloned().collect();
+        if self.agent_caps.agent_capabilities.load_session { capability_names.push("loadSession".into()); }
+        if let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(&self.agent_caps.agent_capabilities.session_capabilities) {
+            capability_names.extend(fields.into_iter().filter(|(_, value)| !value.is_null())
+                .map(|(name, _)| format!("sessionCapabilities.{name}")));
+        }
+        capability_names.sort();
+        capability_names
+    }
+
     /// Whether this agent supports session resumption via `session/load`.
     ///
     /// Reads BOTH signals a live capture has shown so far: the original
@@ -1119,6 +1132,10 @@ impl AcpSession {
 
         {
             let mut guard = self.acp_session_id.lock().await;
+            *guard = Some(new_sid.clone());
+        }
+        {
+            let mut guard = self.provider_reported_session_id.lock().await;
             *guard = Some(new_sid);
         }
 

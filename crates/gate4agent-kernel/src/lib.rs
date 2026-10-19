@@ -976,7 +976,7 @@ impl Gate4AgentKernel {
                     .get(&session.agent_id)
                     .is_some_and(|spec| spec.capabilities.adapters.resume.is_some());
                 if !supports_resume
-                    || !matches!(session.transport, TransportKind::Pty | TransportKind::Pipe)
+                    || !matches!(session.transport, TransportKind::Pty | TransportKind::Pipe | TransportKind::Acp)
                 {
                     return Err(KernelCommandError::UnsupportedCapability {
                         agent_id: session.agent_id.clone(),
@@ -2142,6 +2142,30 @@ mod tests {
             })
         ));
         assert!(rejected.effects.is_empty());
+    }
+
+    #[test]
+    fn acp_resume_reaches_authority_instead_of_transport_rejection() {
+        let mut kernel = Gate4AgentKernel::default();
+        kernel.step([command(1, ControlCommand::Register {
+            instance_id: instance(), agent_id: AgentId::new("codex").unwrap(),
+            transport: TransportKind::Acp,
+        })], []);
+        let result = kernel.step([command(2, ControlCommand::Resume {
+            instance_id: instance(), runtime_policy: verified_runtime_policy(),
+            target: ResumeTarget::ProviderSession {
+                identity: gate4agent_types::ProviderSessionIdentity {
+                    key: gate4agent_types::ProviderSessionKey::SessionId,
+                    id: "prior-thread".to_owned(), transcript_path: None,
+                },
+            },
+            request: ResumeLaunchRequest {
+                working_directory: ".".to_owned(),
+                terminal_size: TerminalSize { rows: 24, columns: 80 }, initial_prompt: None,
+            },
+        })], []);
+        assert!(result.command_outcomes[0].result.is_ok());
+        assert!(matches!(result.effects[0].effect, gate4agent_types::ControlEffect::AuthorizeResume { .. }));
     }
 
     #[test]
