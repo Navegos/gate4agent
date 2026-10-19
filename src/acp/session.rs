@@ -1374,7 +1374,7 @@ impl AcpSession {
         outcome: PermissionOutcome,
         resolution: PendingRequestResolution,
     ) {
-        let value = serde_json::to_value(&outcome).unwrap_or(Value::Null);
+        let value = crate::acp::protocol::permission_response_value(&outcome);
         let response = RpcResponse::success(id.clone(), value);
         if let Ok(json) = serde_json::to_string(&response) {
             write_line_to_process(&self.process, &format!("{}\n", json));

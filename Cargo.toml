@@ -1,6 +1,6 @@
 [package]
 name = "gate4agent"
-version = "0.5.8"
+version = "0.5.9"
 edition = "2021"
 description = "Transport library for CLI AI agents — first tier: Claude Code, Codex, Kimi, Grok. Pipe, PTY, ACP (Agent Client Protocol), and Daemon transports."
 license = "MIT"

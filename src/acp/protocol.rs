@@ -1202,6 +1202,14 @@ pub enum PermissionOutcome {
     Cancelled,
 }
 
+/// The wire result of `session/request_permission` (ACP `RequestPermissionResponse`): the
+/// outcome sits under an `outcome` field, `{"outcome":{"outcome":"selected","optionId":"…"}}`.
+/// A bare outcome object is read by agents as no decision at all (claude-agent-acp: "Tool use
+/// aborted").
+pub fn permission_response_value(outcome: &PermissionOutcome) -> serde_json::Value {
+    serde_json::json!({ "outcome": outcome })
+}
+
 // ---------------------------------------------------------------------------
 // Agent capabilities returned by `initialize`
 // ---------------------------------------------------------------------------
@@ -2553,6 +2561,14 @@ mod tests {
         let s = serde_json::to_string(&outcome).unwrap();
         assert!(s.contains(r#""outcome":"selected""#));
         assert!(s.contains(r#""optionId":"allow-once""#));
+    }
+
+    #[test]
+    fn permission_response_nests_the_outcome() {
+        let v = permission_response_value(&PermissionOutcome::Selected { option_id: "allow".to_owned() });
+        assert_eq!(v["outcome"]["outcome"], "selected");
+        assert_eq!(v["outcome"]["optionId"], "allow");
+        assert_eq!(permission_response_value(&PermissionOutcome::Cancelled), serde_json::json!({"outcome":{"outcome":"cancelled"}}));
     }
 
     #[test]

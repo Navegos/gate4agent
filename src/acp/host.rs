@@ -937,7 +937,7 @@ impl AcpHostAdapter {
                 };
                 let outcome = self.inner.request_permission(&p);
                 HostCallResult {
-                    response: Ok(serde_json::to_value(outcome).unwrap_or(Value::Null)),
+                    response: Ok(crate::acp::protocol::permission_response_value(&outcome)),
                     // See `HostCallOutcome`'s own doc comment -- never read
                     // by the reader loop for this method.
                     outcome: HostCallOutcome::Granted,
@@ -1393,8 +1393,8 @@ mod tests {
             })),
         );
         let value = result.unwrap();
-        assert_eq!(value["outcome"], "selected");
-        assert_eq!(value["optionId"], "always_allow");
+        assert_eq!(value["outcome"]["outcome"], "selected");
+        assert_eq!(value["outcome"]["optionId"], "always_allow");
     }
 
     // -----------------------------------------------------------------------
@@ -1433,8 +1433,8 @@ mod tests {
             })),
         );
         let value = result.unwrap();
-        assert_eq!(value["outcome"], "selected");
-        assert_eq!(value["optionId"], "ao");
+        assert_eq!(value["outcome"]["outcome"], "selected");
+        assert_eq!(value["outcome"]["optionId"], "ao");
     }
 
     #[test]
@@ -1756,11 +1756,11 @@ mod tests {
         );
         match outcome {
             HostOutcome::Immediate(Ok(value)) => {
-                assert_eq!(value["outcome"], "selected");
+                assert_eq!(value["outcome"]["outcome"], "selected");
                 // Yolo alone would pick "aa" (allow_always) -- the gate
                 // overrides that to a reject-kind option, exactly as
                 // `dangerous_command_gate_blocks_execute_permission_request_even_under_yolo_policy` proves for `request_permission` directly.
-                assert_eq!(value["optionId"], "ro");
+                assert_eq!(value["outcome"]["optionId"], "ro");
             }
             other => panic!("expected an immediate gate-blocked decision, got {other:?}"),
         }
