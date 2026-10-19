@@ -15,6 +15,13 @@ The node/c2/harness/TUI stack that used to live in this repository is now
 > `hatchery-c2-client` and `hatchery-c2-protocol` in the hatchery repository. The
 > transport part of the node lives on here as `gate4agent-node-core`.
 
+
+## ACP permission results (0.5.9)
+
+`session/request_permission` results must nest the decision as
+`{ "outcome": { "outcome": "selected"|"cancelled", "optionId": "..." } }`.
+A bare `outcome` string made `claude-agent-acp` abort the tool after auto-approve.
+
 ## Provider tiers
 
 | Provider | Tier | Support path |
