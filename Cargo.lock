@@ -731,7 +731,7 @@ version = "0.5.8"
 
 [[package]]
 name = "gate4agent"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "chrono",
  "gate4agent-catalog",
@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-engine"
-version = "0.5.8"
+version = "0.5.10"
 dependencies = [
  "gate4agent-types",
 ]
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-kernel"
-version = "0.5.8"
+version = "0.5.10"
 dependencies = [
  "gate4agent-catalog",
  "gate4agent-engine",
@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-node-protocol"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "gate4agent-build-stamp",
  "gate4agent-types",
@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "gate4agent-shell-native"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "gate4agent",
  "gate4agent-adapters",
