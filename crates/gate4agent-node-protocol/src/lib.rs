@@ -5897,6 +5897,12 @@ pub struct SpawnSessionOptions {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// `human` | `agent` — recorded in the node's session registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Parent session signature (e.g. `claude#3`) when spawned by another chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 impl SpawnSessionOptions {
@@ -5914,6 +5920,19 @@ impl SpawnSessionOptions {
         }
         if self.effort.as_deref().is_some_and(|e| !ok(e)) {
             return Err("spawn effort is invalid");
+        }
+        if let Some(o) = self.origin.as_deref() {
+            if o != "human" && o != "agent" {
+                return Err("spawn origin must be human or agent");
+            }
+        }
+        if let Some(p) = self.parent_session_id.as_deref() {
+            let parent_ok = !p.is_empty()
+                && p.len() <= Self::MAX_BYTES
+                && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"#-_.:/".contains(&b));
+            if !parent_ok {
+                return Err("spawn parent_session_id is invalid");
+            }
         }
         Ok(())
     }
@@ -11677,11 +11696,11 @@ mod spawn_with_options_wire_tests {
             mode: SessionMode::Pty,
             terminal_size: size,
             initial_prompt: None,
-            options: SpawnSessionOptions { model: Some("m-1".into()), effort: Some("high".into()) },
+            options: SpawnSessionOptions { model: Some("m-1".into()), effort: Some("high".into()), ..Default::default() },
         };
         let v = serde_json::to_value(&with).unwrap();
         assert_eq!(v["kind"], "spawn-with-options");
         assert_eq!(serde_json::from_value::<NodeRequest>(v).unwrap(), with);
-        assert!(SpawnSessionOptions { model: Some("bad model".into()), effort: None }.validate().is_err());
+        assert!(SpawnSessionOptions { model: Some("bad model".into()), ..Default::default() }.validate().is_err());
     }
 }
