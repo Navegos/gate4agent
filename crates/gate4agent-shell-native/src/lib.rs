@@ -529,6 +529,7 @@ impl NativeEffectShell {
                         environment,
                         extra_args,
                         one_shot_session_persistence,
+                        mcp_server,
                     )
                     .await
                 }
@@ -1283,6 +1284,22 @@ impl NativeEffectShell {
                 };
                 match spawned {
                     Ok(session) => {
+                        // Subscribe before session/load: history is replayed before its reply.
+                        let events = session.subscribe();
+                        tracing::info!(capabilities = ?session.capability_names(),
+                            "ACP initialize capabilities");
+                        if let Some(identity) = resumed_provider_session.as_ref() {
+                            if !session.supports_load_session() {
+                                let _ = session.kill().await;
+                                return ControlObservation::SpawnFailed {
+                                    message: "ACP session/load unsupported".to_owned(),
+                                };
+                            }
+                            if let Err(error) = session.load_session(&identity.id).await {
+                                let _ = session.kill().await;
+                                return ControlObservation::SpawnFailed { message: error.to_string() };
+                            }
+                        }
                         if let Some(mode_id) = acp_mode_id.as_ref() {
                             if let Err(message) =
                                 apply_acp_approval_mode(&session, mode_id, request.approval_level)
@@ -1293,7 +1310,6 @@ impl NativeEffectShell {
                             }
                         }
                         let process_id = session.process_id();
-                        let events = session.subscribe();
                         let session_id = session
                             .acp_session_id()
                             .await
@@ -1426,6 +1442,7 @@ impl NativeEffectShell {
         pty_env: Vec<EnvMutation>,
         instance_extra_args: Vec<OsString>,
         one_shot_session_persistence: OneShotSessionPersistence,
+        mcp_server: Option<McpServerSpec>,
     ) -> ControlObservation {
         if let Err(message) = validate_spawn_runtime_policy(
             runtime_policy,
@@ -1507,7 +1524,7 @@ impl NativeEffectShell {
                 one_shot_session_persistence,
             },
             pty_env,
-            None,
+            mcp_server,
         )
         .await
     }
@@ -7462,3 +7479,6 @@ while True:
         let _ = shell.stop_native(key, true).await;
     }
 }
+
+#[cfg(test)]
+mod resume_tests;
