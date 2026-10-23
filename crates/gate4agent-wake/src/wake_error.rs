@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// What a failed wake means for the host.
+///
+/// 0.6: mark this `#[non_exhaustive]` (a new class must not break a host's `match`); not done in
+/// 0.5.x, where it would be a breaking change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WakeClass {

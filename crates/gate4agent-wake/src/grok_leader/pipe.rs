@@ -63,9 +63,10 @@ impl PushError {
     }
 }
 
-/// The `[code=N]` tag of a flattened provider error.
+/// The `[code=N]` tag of a flattened provider error. The tags are appended after the provider's
+/// words, so the last one is ours (the words may hold a `[code=` of their own).
 fn rpc_code_in(text: &str) -> Option<i64> {
-    let at = text.find("[code=")? + "[code=".len();
+    let at = text.rfind("[code=")? + "[code=".len();
     let rest = &text[at..];
     rest[..rest.find(']')?].parse().ok()
 }
@@ -223,6 +224,9 @@ mod class_tests {
         assert_eq!(PushError::PromptFailed("Request failed (402): Grok Build usage balance exhausted".into()).class(), WakeClass::Exhausted);
         assert_eq!(PushError::PromptFailed("failed [code=-32603] [vendor=50150]".into()).provider_error().rpc_code, Some(-32603));
         assert_eq!(PushError::PromptFailed("failed [code=-32603] [vendor=50150]".into()).class(), WakeClass::RateLimited);
+        // The provider's own words may carry a `[code=`; the appended tag is the last one.
+        let words = PushError::PromptFailed("upstream said [code=abc] no [code=-32603] [vendor=42212]".into());
+        assert_eq!((words.provider_error().rpc_code, words.class()), (Some(-32603), WakeClass::Exhausted));
         let plain: PushFailure = PushError::LeaderAbsent.into();
         assert_eq!((plain.class(), plain.provider), (WakeClass::HostDown, None));
     }
