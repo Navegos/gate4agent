@@ -63,6 +63,7 @@ pub mod kimi_acp;
 #[cfg(not(feature = "wake-kimi"))]
 pub use off::kimi;
 pub mod registry;
+pub mod wake_error;
 #[cfg(feature = "wake-grok")]
 pub mod grok_leader;
 #[cfg(feature = "wake-routine")]
