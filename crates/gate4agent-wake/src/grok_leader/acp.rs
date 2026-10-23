@@ -8,6 +8,8 @@
 
 use serde_json::{json, Value};
 
+use crate::wake_error::{classify_rpc_error, ProviderError};
+
 pub enum Inbound {
     Matched { ok: bool, error: Option<String> },
     Ignore,
@@ -104,6 +106,17 @@ pub fn classify_inbound(value: &Value, want: i64) -> Inbound {
     Inbound::Ignore
 }
 
+/// The provider error of a response to our request `want`, with its codes: the JSON-RPC
+/// `error.code`, the vendor code and HTTP status from `error.data` or the text, and the class
+/// ([`crate::wake_error`]). `None`: not our response, or not an error. [`classify_inbound`]
+/// keeps only the message; this keeps everything.
+pub fn inbound_error(value: &Value, want: i64) -> Option<ProviderError> {
+    if value.get("method").is_some() || !value.get("id").is_some_and(|id| id_is(id, want)) {
+        return None;
+    }
+    value.get("error").map(classify_rpc_error)
+}
+
 fn id_is(value: &Value, want: i64) -> bool {
     match value {
         Value::Number(number) => number.as_i64() == Some(want),
@@ -118,6 +131,19 @@ fn id_is(value: &Value, want: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wake_error::WakeClass;
+
+    #[test]
+    fn inbound_error_keeps_the_code_and_the_data() {
+        let e = json!({"jsonrpc": "2.0", "id": 2, "error": {"code": -32603, "message": "Request failed (402): Grok Build usage balance exhausted", "data": {"http_status": 402}}});
+        let p = inbound_error(&e, 2).expect("our error");
+        assert_eq!((p.class, p.rpc_code, p.http_status), (WakeClass::Exhausted, Some(-32603), Some(402)));
+        let m = json!({"id": "client|2", "error": {"code": 50150, "message": "upstream busy"}});
+        assert_eq!(inbound_error(&m, 2).map(|p| (p.class, p.vendor_code)), Some((WakeClass::RateLimited, Some(50150))));
+        assert!(inbound_error(&json!({"id": 2, "result": {}}), 2).is_none(), "a result is no error");
+        assert!(inbound_error(&e, 1).is_none(), "not our id");
+        assert!(inbound_error(&json!({"id": 2, "method": "x", "error": {}}), 2).is_none(), "a request is never ours");
+    }
 
     #[test]
     fn register_is_a_stdio_client_with_empty_capabilities() {

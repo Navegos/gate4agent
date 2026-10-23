@@ -10,7 +10,10 @@ mod frame;
 mod leader;
 mod pipe;
 
-pub use acp::{acp_request, classify_inbound, register_message, registered_is_ready, Inbound};
+pub use acp::{acp_request, classify_inbound, inbound_error, register_message, registered_is_ready, Inbound};
 pub use frame::{encode_frame, MAX_FRAME_BYTES};
-pub use leader::{push_into_session, wake_decrypted_room, wake_decrypted_room_blocking};
-pub use pipe::{grok_home, leader_is_listening, leader_pipe_name, leader_socket, PushError};
+pub use leader::{
+    push_into_session, push_into_session_detailed, wake_decrypted_room, wake_decrypted_room_blocking,
+    wake_decrypted_room_blocking_detailed, wake_decrypted_room_detailed,
+};
+pub use pipe::{grok_home, leader_is_listening, leader_pipe_name, leader_socket, PushError, PushFailure};

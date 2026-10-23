@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::wake_error::{classify, ProviderError, WakeClass};
+
 /// Fixed SipHash-1-3 keys from grok `leader/transport.rs`. Do not change.
 const PIPE_KEY_0: u64 = 0x6772_6f6b_6c65_6164;
 const PIPE_KEY_1: u64 = 0x6572_5f70_6970_6521;
@@ -29,6 +31,67 @@ pub enum PushError {
     PromptFailed(String),
     #[error("frame-too-large")]
     FrameTooLarge,
+}
+
+impl PushError {
+    /// The class of this failure. A provider error's codes travel in its text as tags
+    /// (`[code=..] [vendor=..] [http=..]`, see [`crate::wake_error::code_tags`]), so this reads
+    /// them back; a leader that is absent or starting is `host_down`, a session that does not
+    /// load and says nothing more is `session_gone`.
+    pub fn class(&self) -> WakeClass {
+        self.provider_error().class
+    }
+
+    /// The provider error behind this failure, as far as the error itself carries it (the
+    /// `_detailed` push functions return the one read from the JSON-RPC error directly).
+    pub fn provider_error(&self) -> ProviderError {
+        let plain = |class| ProviderError { class, rpc_code: None, vendor_code: None, http_status: None, retry_after_s: None, message: self.to_string() };
+        let read = |text: &str, otherwise: WakeClass| {
+            let mut e = classify(rpc_code_in(text), None, text);
+            if e.class == WakeClass::Other {
+                e.class = otherwise;
+            }
+            e
+        };
+        match self {
+            PushError::LeaderAbsent | PushError::LeaderNotReady => plain(WakeClass::HostDown),
+            PushError::FrameTooLarge => plain(WakeClass::Context),
+            PushError::Protocol(text) => read(text, WakeClass::HostDown),
+            PushError::SessionLoadFailed(text) => read(text, WakeClass::SessionGone),
+            PushError::PromptFailed(text) => read(text, WakeClass::Other),
+        }
+    }
+}
+
+/// The `[code=N]` tag of a flattened provider error.
+fn rpc_code_in(text: &str) -> Option<i64> {
+    let at = text.find("[code=")? + "[code=".len();
+    let rest = &text[at..];
+    rest[..rest.find(']')?].parse().ok()
+}
+
+/// A failed push with the provider error it came from, when there was one: the codes and the
+/// class as the leader's JSON-RPC error carried them (returned by the `_detailed` functions;
+/// the plain ones return [`PushFailure::error`] only).
+#[derive(Debug, Error)]
+#[error("{error}")]
+pub struct PushFailure {
+    #[source]
+    pub error: PushError,
+    pub provider: Option<ProviderError>,
+}
+
+impl PushFailure {
+    /// The class: the provider error's when there is one, else the [`PushError`]'s.
+    pub fn class(&self) -> WakeClass {
+        self.provider.as_ref().map_or_else(|| self.error.class(), |p| p.class)
+    }
+}
+
+impl From<PushError> for PushFailure {
+    fn from(error: PushError) -> Self {
+        PushFailure { error, provider: None }
+    }
 }
 
 /// `$GROK_HOME` verbatim when set, otherwise `<home>/.grok` with the home
@@ -141,5 +204,26 @@ mod tests {
             PathBuf::from(r"D:\custom.sock")
         );
         assert_eq!(leader_socket(home, Some(OsStr::new(""))), home.join("leader.sock"));
+    }
+}
+
+#[cfg(test)]
+mod class_tests {
+    use super::*;
+
+    #[test]
+    fn push_errors_have_a_class() {
+        assert_eq!(PushError::LeaderAbsent.class(), WakeClass::HostDown);
+        assert_eq!(PushError::LeaderNotReady.class(), WakeClass::HostDown);
+        assert_eq!(PushError::FrameTooLarge.class(), WakeClass::Context);
+        assert_eq!(PushError::Protocol("leader-shutdown".into()).class(), WakeClass::HostDown);
+        assert_eq!(PushError::Protocol("something odd".into()).class(), WakeClass::HostDown);
+        assert_eq!(PushError::SessionLoadFailed("no record".into()).class(), WakeClass::SessionGone);
+        assert_eq!(PushError::SessionLoadFailed("Request failed (402): balance exhausted".into()).class(), WakeClass::Exhausted);
+        assert_eq!(PushError::PromptFailed("Request failed (402): Grok Build usage balance exhausted".into()).class(), WakeClass::Exhausted);
+        assert_eq!(PushError::PromptFailed("failed [code=-32603] [vendor=50150]".into()).provider_error().rpc_code, Some(-32603));
+        assert_eq!(PushError::PromptFailed("failed [code=-32603] [vendor=50150]".into()).class(), WakeClass::RateLimited);
+        let plain: PushFailure = PushError::LeaderAbsent.into();
+        assert_eq!((plain.class(), plain.provider), (WakeClass::HostDown, None));
     }
 }

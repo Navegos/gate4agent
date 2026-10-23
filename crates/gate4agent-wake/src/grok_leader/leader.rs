@@ -12,12 +12,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{timeout, Instant};
 
 use super::acp::{
-    acp_envelope, acp_request, classify_inbound, disconnect_message, initialize_params,
+    acp_envelope, acp_request, classify_inbound, disconnect_message, inbound_error, initialize_params,
     register_message, registered_is_ready, server_type, session_load_params, session_prompt_params,
     Inbound,
 };
 use super::frame::{encode_frame, MAX_FRAME_BYTES};
-use super::pipe::PushError;
+use super::pipe::{PushError, PushFailure};
+use crate::wake_error::code_tags;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -36,6 +37,19 @@ pub async fn push_into_session(
     cwd: &str,
     text: &str,
 ) -> Result<(), PushError> {
+    push_into_session_detailed(sock, session_id, cwd, text).await.map_err(|f| f.error)
+}
+
+/// [`push_into_session`] with the provider error kept: a refused `session/load` or
+/// `session/prompt` returns the leader's JSON-RPC error classified, with its code, vendor code
+/// and HTTP status ([`PushFailure::provider`]); the [`PushError`] text carries the same codes as
+/// tags.
+pub async fn push_into_session_detailed(
+    sock: &Path,
+    session_id: &str,
+    cwd: &str,
+    text: &str,
+) -> Result<(), PushFailure> {
     #[cfg(windows)]
     let stream = {
         let pipe = super::pipe::leader_pipe_os_path(sock);
@@ -74,6 +88,16 @@ pub async fn wake_decrypted_room(
     push_into_session(sock, session_id, cwd, plaintext).await
 }
 
+/// [`wake_decrypted_room`] with the provider error kept (see [`push_into_session_detailed`]).
+pub async fn wake_decrypted_room_detailed(
+    sock: &Path,
+    session_id: &str,
+    cwd: &str,
+    plaintext: &str,
+) -> Result<(), PushFailure> {
+    push_into_session_detailed(sock, session_id, cwd, plaintext).await
+}
+
 /// Synchronous wake for a caller that is not already on a tokio runtime.
 ///
 /// `Ok` means `session/load` succeeded and the `session/prompt` frame was
@@ -87,6 +111,18 @@ pub fn wake_decrypted_room_blocking(
     cwd: &str,
     plaintext: &str,
 ) -> Result<(), PushError> {
+    wake_decrypted_room_blocking_detailed(sock, session_id, cwd, plaintext).map_err(|f| f.error)
+}
+
+/// [`wake_decrypted_room_blocking`] with the provider error kept: a refused `session/load`
+/// comes back classified (see [`push_into_session_detailed`]). The prompt's own result is not
+/// awaited here, as there.
+pub fn wake_decrypted_room_blocking_detailed(
+    sock: &Path,
+    session_id: &str,
+    cwd: &str,
+    plaintext: &str,
+) -> Result<(), PushFailure> {
     let sock = sock.to_path_buf();
     let session_id = session_id.to_string();
     let cwd = cwd.to_string();
@@ -100,7 +136,7 @@ pub fn wake_decrypted_room_blocking(
         {
             Ok(runtime) => runtime,
             Err(err) => {
-                let _ = tx.send(Err(PushError::Protocol(err.to_string())));
+                let _ = tx.send(Err(PushError::Protocol(err.to_string()).into()));
                 return;
             }
         };
@@ -108,7 +144,7 @@ pub fn wake_decrypted_room_blocking(
             let stream = match connect_leader(&sock).await {
                 Ok(stream) => stream,
                 Err(err) => {
-                    let _ = tx.send(Err(err));
+                    let _ = tx.send(Err(err.into()));
                     return;
                 }
             };
@@ -121,7 +157,7 @@ pub fn wake_decrypted_room_blocking(
             }
             let payload = acp_request(PROMPT_ID, "session/prompt", session_prompt_params(&session_id, &plaintext));
             if let Err(err) = write_value(&mut writer, &acp_envelope(&payload)).await {
-                let _ = tx.send(Err(err));
+                let _ = tx.send(Err(err.into()));
                 return;
             }
             let _ = tx.send(Ok(()));
@@ -137,7 +173,7 @@ pub fn wake_decrypted_room_blocking(
     });
     match rx.recv_timeout(Duration::from_secs(20)) {
         Ok(result) => result,
-        Err(_) => Err(PushError::LeaderAbsent),
+        Err(_) => Err(PushError::LeaderAbsent.into()),
     }
 }
 
@@ -175,7 +211,7 @@ async fn prepare_session<R, W>(
     writer: &mut W,
     session_id: &str,
     cwd: &str,
-) -> Result<(), PushError>
+) -> Result<(), PushFailure>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -220,7 +256,7 @@ async fn acp_call_already_written<R, F>(
     id: i64,
     limit: Duration,
     fail: F,
-) -> Result<(), PushError>
+) -> Result<(), PushFailure>
 where
     R: AsyncRead + Unpin,
     F: Fn(String) -> PushError,
@@ -229,7 +265,7 @@ where
     loop {
         let value = read_one(reader, deadline).await?;
         if let Some(err) = terminal(&value) {
-            return Err(err);
+            return Err(err.into());
         }
         if server_type(&value) != Some("acp") {
             continue;
@@ -247,15 +283,15 @@ where
             Inbound::Matched { ok: false, error } => {
                 let message = truncate(&error.unwrap_or_else(|| "error".to_string()));
                 if message.contains("leader_starting") {
-                    return Err(PushError::LeaderNotReady);
+                    return Err(PushError::LeaderNotReady.into());
                 }
-                return Err(fail(message));
+                return Err(refused(&inner, id, message, &fail));
             }
         }
     }
 }
 
-async fn finish<S>(stream: S, session_id: &str, cwd: &str, text: &str) -> Result<(), PushError>
+async fn finish<S>(stream: S, session_id: &str, cwd: &str, text: &str) -> Result<(), PushFailure>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -271,7 +307,7 @@ async fn drive<R, W>(
     session_id: &str,
     cwd: &str,
     text: &str,
-) -> Result<(), PushError>
+) -> Result<(), PushFailure>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -329,7 +365,7 @@ async fn acp_call<R, W, F>(
     params: Value,
     limit: Duration,
     fail: F,
-) -> Result<(), PushError>
+) -> Result<(), PushFailure>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -341,7 +377,7 @@ where
     loop {
         let value = read_one(reader, deadline).await?;
         if let Some(err) = terminal(&value) {
-            return Err(err);
+            return Err(err.into());
         }
         if server_type(&value) != Some("acp") {
             continue;
@@ -359,12 +395,20 @@ where
             Inbound::Matched { ok: false, error } => {
                 let message = truncate(&error.unwrap_or_else(|| "error".to_string()));
                 if message.contains("leader_starting") {
-                    return Err(PushError::LeaderNotReady);
+                    return Err(PushError::LeaderNotReady.into());
                 }
-                return Err(fail(message));
+                return Err(refused(&inner, id, message, &fail));
             }
         }
     }
+}
+
+/// A refused request: the [`PushError`] (its text carrying the codes as tags, so a caller of
+/// the plain API keeps them too) and the classified provider error.
+fn refused(inner: &Value, id: i64, message: String, fail: &impl Fn(String) -> PushError) -> PushFailure {
+    let provider = inbound_error(inner, id);
+    let tags = provider.as_ref().map(code_tags).unwrap_or_default();
+    PushFailure { error: fail(format!("{message}{tags}")), provider }
 }
 
 fn terminal(value: &Value) -> Option<PushError> {
@@ -466,7 +510,7 @@ mod socket_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
 
-    use super::wake_decrypted_room;
+    use super::{wake_decrypted_room, wake_decrypted_room_detailed};
     use super::super::frame::encode_frame;
 
     async fn read_frame(stream: &mut tokio::net::UnixStream) -> Value {
@@ -529,8 +573,9 @@ mod socket_tests {
                 prompts.lock().expect("prompts").push(text);
                 if refuse_prompt {
                     let id = inner["id"].clone();
-                    let body = json!({"jsonrpc":"2.0","id": id, "error": {"message": "refused"}})
-                        .to_string();
+                    // The incident's refusal: a 402 with the vendor code in `data`.
+                    let error = json!({"code": -32603, "message": "Request failed (402): usage balance exhausted", "data": {"http_status": 402, "code": 42212}});
+                    let body = json!({"jsonrpc":"2.0","id": id, "error": error}).to_string();
                     write_frame(&mut stream, &json!({"type":"acp","payload": body})).await;
                     continue;
                 }
@@ -555,6 +600,33 @@ mod socket_tests {
         let got = prompts.lock().expect("prompts");
         assert_eq!(got.len(), 1, "session/prompt fired more than once");
         assert_eq!(got[0], "already-decrypted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_refused_prompt_keeps_its_codes_and_class() {
+        use crate::wake_error::WakeClass;
+        let dir = sock_dir("refused-detailed");
+        let path = dir.join("leader.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let server = tokio::spawn(serve(listener, true, Arc::clone(&prompts)));
+        let failure = wake_decrypted_room_detailed(&path, "sess-local", "/tmp", "already-decrypted")
+            .await
+            .expect_err("a refused prompt is not success");
+        let _ = tokio::time::timeout(Duration::from_secs(3), server).await;
+        let provider = failure.provider.clone().expect("the leader's error is kept");
+        assert_eq!(
+            (provider.class, provider.rpc_code, provider.vendor_code, provider.http_status),
+            (WakeClass::Exhausted, Some(-32603), Some(42212), Some(402))
+        );
+        assert_eq!(failure.class(), WakeClass::Exhausted);
+        // The plain error carries the same codes, so the old API does not lose them either.
+        assert!(matches!(failure.error, super::super::pipe::PushError::PromptFailed(_)));
+        let text = failure.error.to_string();
+        assert!(text.contains("[code=-32603]") && text.contains("[vendor=42212]") && text.contains("[http=402]"), "{text}");
+        let again = failure.error.provider_error();
+        assert_eq!((again.class, again.rpc_code, again.vendor_code, again.http_status), (WakeClass::Exhausted, Some(-32603), Some(42212), Some(402)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
