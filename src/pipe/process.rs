@@ -91,8 +91,28 @@ impl PipeProcess {
         initial_prompt: &str,
         options: PipeProcessOptions,
     ) -> Result<Self, std::io::Error> {
-        let spawn_opts =
-            Self::pipe_options_to_spawn_opts(tool, initial_prompt, &options, working_dir);
+        Self::new_with_options_and_env(tool, working_dir, initial_prompt, options, &[])
+    }
+
+    /// Same as [`PipeProcess::new_with_options`], plus caller-owned child
+    /// environment variables (`SessionConfig.env_vars`). The child inherits
+    /// the host environment and each pair is applied on top of it, so a
+    /// matching key overrides the inherited value (the same override rule the
+    /// PTY transport uses for its `env_vars`).
+    pub(crate) fn new_with_options_and_env(
+        tool: CliTool,
+        working_dir: &std::path::Path,
+        initial_prompt: &str,
+        options: PipeProcessOptions,
+        env_vars: &[(String, String)],
+    ) -> Result<Self, std::io::Error> {
+        let spawn_opts = Self::pipe_options_to_spawn_opts(
+            tool,
+            initial_prompt,
+            &options,
+            working_dir,
+            env_vars,
+        );
         Self::new_with_spawn_options(tool, spawn_opts)
     }
 
@@ -126,10 +146,33 @@ impl PipeProcess {
         launch: &LaunchSpec,
         prompt_delivery: PipePromptDelivery,
     ) -> Result<Self, std::io::Error> {
+        Self::new_with_launch_and_env(
+            tool,
+            working_dir,
+            initial_prompt,
+            launch,
+            prompt_delivery,
+            &[],
+        )
+    }
+
+    /// Same as [`PipeProcess::new_with_launch`], plus caller-owned child
+    /// environment variables applied on top of the inherited host environment.
+    pub(crate) fn new_with_launch_and_env(
+        tool: CliTool,
+        working_dir: &std::path::Path,
+        initial_prompt: &str,
+        launch: &LaunchSpec,
+        prompt_delivery: PipePromptDelivery,
+        env_vars: &[(String, String)],
+    ) -> Result<Self, std::io::Error> {
         let mut cmd = Command::new(&launch.program);
         cmd.args(&launch.fixed_args);
         if prompt_delivery == PipePromptDelivery::Positional {
             cmd.arg(initial_prompt);
+        }
+        for (key, value) in env_vars {
+            cmd.env(key, value);
         }
         Self::spawn_command(
             tool,
@@ -199,6 +242,7 @@ impl PipeProcess {
         prompt: &str,
         options: &PipeProcessOptions,
         working_dir: &std::path::Path,
+        env_vars: &[(String, String)],
     ) -> SpawnOptions {
         SpawnOptions {
             working_dir: working_dir.to_path_buf(),
@@ -207,7 +251,7 @@ impl PipeProcess {
             model: options.claude.model.clone(),
             append_system_prompt: options.claude.append_system_prompt.clone(),
             extra_args: options.extra_args.clone(),
-            env_vars: Vec::new(),
+            env_vars: env_vars.to_vec(),
             ..Default::default()
         }
     }
