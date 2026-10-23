@@ -87,9 +87,14 @@ impl PipeSession {
         let tool = config.tool;
         let session_id = uuid_v4();
 
-        let pipe =
-            PipeProcess::new_with_options(tool, &config.working_dir, initial_prompt, options)
-                .map_err(|e| AgentError::Spawn { source: e })?;
+        let pipe = PipeProcess::new_with_options_and_env(
+            tool,
+            &config.working_dir,
+            initial_prompt,
+            options,
+            &config.env_vars,
+        )
+        .map_err(|e| AgentError::Spawn { source: e })?;
 
         let (tx, initial_events) = broadcast::channel::<AgentEvent>(256);
 
@@ -126,12 +131,13 @@ impl PipeSession {
     ) -> Result<Self, AgentError> {
         let tool = config.tool;
         let session_id = uuid_v4();
-        let pipe = PipeProcess::new_with_launch(
+        let pipe = PipeProcess::new_with_launch_and_env(
             tool,
             &config.working_dir,
             initial_prompt,
             launch,
             prompt_delivery,
+            &config.env_vars,
         )
         .map_err(|source| AgentError::Spawn { source })?;
         let (tx, initial_events) = broadcast::channel::<AgentEvent>(256);
